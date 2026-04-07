@@ -1,0 +1,57 @@
+[package]
+name        = "ramflow"
+version     = "0.1.0"
+edition     = "2021"
+description = "AethelStream memory orchestration layer – pinned-buffer pools, NVMe I/O, CUDA bridging"
+# build.rs is auto-detected; this entry makes it explicit
+build       = "build.rs"
+
+# ---------------------------------------------------------------------------
+# Features
+# ---------------------------------------------------------------------------
+[features]
+# `cuda` is on by default — real GPU path.  Requires nvcc at build time.
+default   = ["cuda"]
+
+# Drop-in replacement for `cuda` on CI/machines without a GPU.
+# Activating this disables the real CUDA link and swaps in no-op stubs.
+mock-cuda = []
+
+# Idea 4: SSD wear-budget manager.  Off by default so the critical path pays
+# no cost when not needed.
+ssd-wear  = []
+
+# `cuda` and `mock-cuda` are mutually exclusive; the build script enforces
+# this at compile time.
+cuda      = []
+
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+[dependencies]
+# Structured diagnostics & Display for RamFlowError
+thiserror = "1"
+
+# io_uring bindings (used by DirectNvmeEngine)
+io-uring  = { version = "0.7", optional = true }
+
+# Atomic primitives beyond std
+crossbeam-utils = "0.8"
+
+# Sprint 1: posix_memalign (exact-size allocation) and libc::free
+# Used in src/allocator/pinned.rs and src/allocator/drop_guard.rs
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_System_Memory"
+] }
+
+[build-dependencies]
+# nothing beyond std — we shell out to nvcc manually in build.rs
+
+# ---------------------------------------------------------------------------
+# Dev-dependencies (integration tests under ramflow/tests/)
+# ---------------------------------------------------------------------------
+[dev-dependencies]
+# nothing yet – stubs only for Sprint 0
