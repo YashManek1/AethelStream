@@ -25,6 +25,10 @@ ssd-wear  = []
 # this at compile time.
 cuda      = []
 
+# Use io_uring::split() fallback path instead of shared queue API.
+# Keep this off for best performance; enable for compatibility/debugging.
+io-uring-use-split = []
+
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
@@ -33,7 +37,8 @@ cuda      = []
 thiserror = "1"
 
 # io_uring bindings (used by DirectNvmeEngine)
-io-uring  = { version = "0.7", optional = true }
+# Pinned to 0.7.11 because this code path uses submission_shared/completion_shared.
+io-uring  = { version = "=0.7.11", optional = true }
 
 # Atomic primitives beyond std
 crossbeam-utils = "0.8"
