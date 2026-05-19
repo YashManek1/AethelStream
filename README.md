@@ -165,7 +165,7 @@ Optimizer states are one of the largest memory bottlenecks.
 
 AethelStream applies low-rank gradient projection:
 
-R_t = P_t^T G_t Q_t
+R_t = P_t^{T} G_t Q_t
 
 Gradients are projected into compact low-rank space, updated there, then reconstructed.
 
