@@ -1,0 +1,1922 @@
+{
+  "transformer.wpe.weight": {
+    "file": "embed.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 192,
+        "end": 1573056,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.wte.weight": {
+    "file": "embed.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 1573056,
+        "end": 78767808,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.0.attn.c_attn.bias": {
+    "file": "layer_0.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 1176,
+        "end": 5784,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.0.attn.c_attn.weight": {
+    "file": "layer_0.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 5784,
+        "end": 3544728,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.0.attn.c_proj.bias": {
+    "file": "layer_0.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 3544728,
+        "end": 3546264,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.0.attn.c_proj.weight": {
+    "file": "layer_0.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 3546264,
+        "end": 4725912,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.0.ln_1.bias": {
+    "file": "layer_0.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4725912,
+        "end": 4727448,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.0.ln_1.weight": {
+    "file": "layer_0.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4727448,
+        "end": 4728984,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.0.ln_2.bias": {
+    "file": "layer_0.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4728984,
+        "end": 4730520,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.0.ln_2.weight": {
+    "file": "layer_0.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4730520,
+        "end": 4732056,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.0.mlp.c_fc.bias": {
+    "file": "layer_0.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4732056,
+        "end": 4738200,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.0.mlp.c_fc.weight": {
+    "file": "layer_0.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4738200,
+        "end": 9456792,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.0.mlp.c_proj.bias": {
+    "file": "layer_0.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 9456792,
+        "end": 9458328,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.0.mlp.c_proj.weight": {
+    "file": "layer_0.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 9458328,
+        "end": 14176920,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.1.attn.c_attn.bias": {
+    "file": "layer_1.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 1176,
+        "end": 5784,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.1.attn.c_attn.weight": {
+    "file": "layer_1.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 5784,
+        "end": 3544728,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.1.attn.c_proj.bias": {
+    "file": "layer_1.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 3544728,
+        "end": 3546264,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.1.attn.c_proj.weight": {
+    "file": "layer_1.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 3546264,
+        "end": 4725912,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.1.ln_1.bias": {
+    "file": "layer_1.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4725912,
+        "end": 4727448,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.1.ln_1.weight": {
+    "file": "layer_1.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4727448,
+        "end": 4728984,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.1.ln_2.bias": {
+    "file": "layer_1.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4728984,
+        "end": 4730520,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.1.ln_2.weight": {
+    "file": "layer_1.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4730520,
+        "end": 4732056,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.1.mlp.c_fc.bias": {
+    "file": "layer_1.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4732056,
+        "end": 4738200,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.1.mlp.c_fc.weight": {
+    "file": "layer_1.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4738200,
+        "end": 9456792,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.1.mlp.c_proj.bias": {
+    "file": "layer_1.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 9456792,
+        "end": 9458328,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.1.mlp.c_proj.weight": {
+    "file": "layer_1.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 9458328,
+        "end": 14176920,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.2.attn.c_attn.bias": {
+    "file": "layer_2.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 1176,
+        "end": 5784,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.2.attn.c_attn.weight": {
+    "file": "layer_2.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 5784,
+        "end": 3544728,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.2.attn.c_proj.bias": {
+    "file": "layer_2.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 3544728,
+        "end": 3546264,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.2.attn.c_proj.weight": {
+    "file": "layer_2.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 3546264,
+        "end": 4725912,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.2.ln_1.bias": {
+    "file": "layer_2.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4725912,
+        "end": 4727448,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.2.ln_1.weight": {
+    "file": "layer_2.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4727448,
+        "end": 4728984,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.2.ln_2.bias": {
+    "file": "layer_2.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4728984,
+        "end": 4730520,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.2.ln_2.weight": {
+    "file": "layer_2.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4730520,
+        "end": 4732056,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.2.mlp.c_fc.bias": {
+    "file": "layer_2.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4732056,
+        "end": 4738200,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.2.mlp.c_fc.weight": {
+    "file": "layer_2.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4738200,
+        "end": 9456792,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.2.mlp.c_proj.bias": {
+    "file": "layer_2.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 9456792,
+        "end": 9458328,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.2.mlp.c_proj.weight": {
+    "file": "layer_2.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 9458328,
+        "end": 14176920,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.3.attn.c_attn.bias": {
+    "file": "layer_3.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 1176,
+        "end": 5784,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.3.attn.c_attn.weight": {
+    "file": "layer_3.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 5784,
+        "end": 3544728,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.3.attn.c_proj.bias": {
+    "file": "layer_3.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 3544728,
+        "end": 3546264,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.3.attn.c_proj.weight": {
+    "file": "layer_3.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 3546264,
+        "end": 4725912,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.3.ln_1.bias": {
+    "file": "layer_3.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4725912,
+        "end": 4727448,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.3.ln_1.weight": {
+    "file": "layer_3.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4727448,
+        "end": 4728984,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.3.ln_2.bias": {
+    "file": "layer_3.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4728984,
+        "end": 4730520,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.3.ln_2.weight": {
+    "file": "layer_3.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4730520,
+        "end": 4732056,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.3.mlp.c_fc.bias": {
+    "file": "layer_3.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4732056,
+        "end": 4738200,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.3.mlp.c_fc.weight": {
+    "file": "layer_3.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4738200,
+        "end": 9456792,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.3.mlp.c_proj.bias": {
+    "file": "layer_3.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 9456792,
+        "end": 9458328,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.3.mlp.c_proj.weight": {
+    "file": "layer_3.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 9458328,
+        "end": 14176920,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.4.attn.c_attn.bias": {
+    "file": "layer_4.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 3424,
+        "end": 3568,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446368,
+        "end": 446372,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 447964,
+        "end": 449116,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.4.attn.c_attn.weight": {
+    "file": "layer_4.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 3568,
+        "end": 114160,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446372,
+        "end": 446380,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 449116,
+        "end": 1333852,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.4.attn.c_proj.bias": {
+    "file": "layer_4.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 114160,
+        "end": 114208,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446380,
+        "end": 446384,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1333852,
+        "end": 1334236,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.4.attn.c_proj.weight": {
+    "file": "layer_4.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 114208,
+        "end": 151072,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446384,
+        "end": 446392,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1334236,
+        "end": 1629148,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.4.ln_1.bias": {
+    "file": "layer_4.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 151072,
+        "end": 151120,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446392,
+        "end": 446396,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1629148,
+        "end": 1629532,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.4.ln_2.bias": {
+    "file": "layer_4.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 151120,
+        "end": 151168,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446396,
+        "end": 446400,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1629532,
+        "end": 1629916,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.4.ln_2.weight": {
+    "file": "layer_4.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 151168,
+        "end": 151216,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446400,
+        "end": 446404,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1629916,
+        "end": 1630300,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.4.mlp.c_fc.bias": {
+    "file": "layer_4.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 151216,
+        "end": 151408,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446404,
+        "end": 446408,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1630300,
+        "end": 1631836,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.4.mlp.c_fc.weight": {
+    "file": "layer_4.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 151408,
+        "end": 298864,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446408,
+        "end": 446416,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1631836,
+        "end": 2811484,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.4.mlp.c_proj.bias": {
+    "file": "layer_4.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 298864,
+        "end": 298912,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446416,
+        "end": 446420,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 2811484,
+        "end": 2811868,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.4.mlp.c_proj.weight": {
+    "file": "layer_4.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 298912,
+        "end": 446368,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446420,
+        "end": 446428,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 2811868,
+        "end": 3991516,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.4.ln_1.weight": {
+    "file": "layer_4.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 446428,
+        "end": 447964,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.5.attn.c_attn.bias": {
+    "file": "layer_5.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 3224,
+        "end": 3368,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446120,
+        "end": 446124,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 449248,
+        "end": 450400,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.5.attn.c_attn.weight": {
+    "file": "layer_5.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 3368,
+        "end": 113960,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446124,
+        "end": 446132,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 450400,
+        "end": 1335136,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.5.attn.c_proj.bias": {
+    "file": "layer_5.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 113960,
+        "end": 114008,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446132,
+        "end": 446136,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1335136,
+        "end": 1335520,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.5.attn.c_proj.weight": {
+    "file": "layer_5.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 114008,
+        "end": 150872,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446136,
+        "end": 446144,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1335520,
+        "end": 1630432,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.5.ln_1.bias": {
+    "file": "layer_5.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 150872,
+        "end": 150920,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446144,
+        "end": 446148,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1630432,
+        "end": 1630816,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.5.ln_2.bias": {
+    "file": "layer_5.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 150920,
+        "end": 150968,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446148,
+        "end": 446152,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1630816,
+        "end": 1631200,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.5.mlp.c_fc.bias": {
+    "file": "layer_5.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 150968,
+        "end": 151160,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446152,
+        "end": 446156,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1631200,
+        "end": 1632736,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.5.mlp.c_fc.weight": {
+    "file": "layer_5.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 151160,
+        "end": 298616,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446156,
+        "end": 446164,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1632736,
+        "end": 2812384,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.5.mlp.c_proj.bias": {
+    "file": "layer_5.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 298616,
+        "end": 298664,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446164,
+        "end": 446168,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 2812384,
+        "end": 2812768,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.5.mlp.c_proj.weight": {
+    "file": "layer_5.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 298664,
+        "end": 446120,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446168,
+        "end": 446176,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 2812768,
+        "end": 3992416,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.5.ln_1.weight": {
+    "file": "layer_5.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 446176,
+        "end": 447712,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.5.ln_2.weight": {
+    "file": "layer_5.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 447712,
+        "end": 449248,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.6.attn.c_attn.bias": {
+    "file": "layer_6.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 3424,
+        "end": 3568,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446368,
+        "end": 446372,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 447964,
+        "end": 449116,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.6.attn.c_attn.weight": {
+    "file": "layer_6.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 3568,
+        "end": 114160,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446372,
+        "end": 446380,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 449116,
+        "end": 1333852,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.6.attn.c_proj.bias": {
+    "file": "layer_6.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 114160,
+        "end": 114208,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446380,
+        "end": 446384,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1333852,
+        "end": 1334236,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.6.attn.c_proj.weight": {
+    "file": "layer_6.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 114208,
+        "end": 151072,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446384,
+        "end": 446392,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1334236,
+        "end": 1629148,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.6.ln_1.bias": {
+    "file": "layer_6.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 151072,
+        "end": 151120,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446392,
+        "end": 446396,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1629148,
+        "end": 1629532,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.6.ln_2.bias": {
+    "file": "layer_6.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 151120,
+        "end": 151168,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446396,
+        "end": 446400,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1629532,
+        "end": 1629916,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.6.ln_2.weight": {
+    "file": "layer_6.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 151168,
+        "end": 151216,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446400,
+        "end": 446404,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1629916,
+        "end": 1630300,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.6.mlp.c_fc.bias": {
+    "file": "layer_6.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 151216,
+        "end": 151408,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446404,
+        "end": 446408,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1630300,
+        "end": 1631836,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.6.mlp.c_fc.weight": {
+    "file": "layer_6.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 151408,
+        "end": 298864,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446408,
+        "end": 446416,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1631836,
+        "end": 2811484,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.6.mlp.c_proj.bias": {
+    "file": "layer_6.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 298864,
+        "end": 298912,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446416,
+        "end": 446420,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 2811484,
+        "end": 2811868,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.6.mlp.c_proj.weight": {
+    "file": "layer_6.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 298912,
+        "end": 446368,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446420,
+        "end": 446428,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 2811868,
+        "end": 3991516,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.6.ln_1.weight": {
+    "file": "layer_6.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 446428,
+        "end": 447964,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.7.attn.c_attn.bias": {
+    "file": "layer_7.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 3424,
+        "end": 3568,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446368,
+        "end": 446372,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 447964,
+        "end": 449116,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.7.attn.c_attn.weight": {
+    "file": "layer_7.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 3568,
+        "end": 114160,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446372,
+        "end": 446380,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 449116,
+        "end": 1333852,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.7.attn.c_proj.bias": {
+    "file": "layer_7.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 114160,
+        "end": 114208,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446380,
+        "end": 446384,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1333852,
+        "end": 1334236,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.7.attn.c_proj.weight": {
+    "file": "layer_7.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 114208,
+        "end": 151072,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446384,
+        "end": 446392,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1334236,
+        "end": 1629148,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.7.ln_1.bias": {
+    "file": "layer_7.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 151072,
+        "end": 151120,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446392,
+        "end": 446396,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1629148,
+        "end": 1629532,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.7.ln_2.bias": {
+    "file": "layer_7.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 151120,
+        "end": 151168,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446396,
+        "end": 446400,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1629532,
+        "end": 1629916,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.7.ln_2.weight": {
+    "file": "layer_7.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 151168,
+        "end": 151216,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446400,
+        "end": 446404,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1629916,
+        "end": 1630300,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.7.mlp.c_fc.bias": {
+    "file": "layer_7.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 151216,
+        "end": 151408,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446404,
+        "end": 446408,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1630300,
+        "end": 1631836,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.7.mlp.c_fc.weight": {
+    "file": "layer_7.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 151408,
+        "end": 298864,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446408,
+        "end": 446416,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 1631836,
+        "end": 2811484,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.7.mlp.c_proj.bias": {
+    "file": "layer_7.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 298864,
+        "end": 298912,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446416,
+        "end": 446420,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 2811484,
+        "end": 2811868,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.7.mlp.c_proj.weight": {
+    "file": "layer_7.safetensors",
+    "tensors": {
+      "absmax": {
+        "start": 298912,
+        "end": 446368,
+        "dtype": "F32"
+      },
+      "shape": {
+        "start": 446420,
+        "end": 446428,
+        "dtype": "I32"
+      },
+      "packed": {
+        "start": 2811868,
+        "end": 3991516,
+        "dtype": "U8"
+      }
+    }
+  },
+  "transformer.h.7.ln_1.weight": {
+    "file": "layer_7.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 446428,
+        "end": 447964,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.8.attn.c_attn.bias": {
+    "file": "layer_8.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 1176,
+        "end": 5784,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.8.attn.c_attn.weight": {
+    "file": "layer_8.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 5784,
+        "end": 3544728,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.8.attn.c_proj.bias": {
+    "file": "layer_8.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 3544728,
+        "end": 3546264,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.8.attn.c_proj.weight": {
+    "file": "layer_8.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 3546264,
+        "end": 4725912,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.8.ln_1.bias": {
+    "file": "layer_8.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4725912,
+        "end": 4727448,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.8.ln_1.weight": {
+    "file": "layer_8.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4727448,
+        "end": 4728984,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.8.ln_2.bias": {
+    "file": "layer_8.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4728984,
+        "end": 4730520,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.8.ln_2.weight": {
+    "file": "layer_8.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4730520,
+        "end": 4732056,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.8.mlp.c_fc.bias": {
+    "file": "layer_8.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4732056,
+        "end": 4738200,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.8.mlp.c_fc.weight": {
+    "file": "layer_8.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4738200,
+        "end": 9456792,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.8.mlp.c_proj.bias": {
+    "file": "layer_8.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 9456792,
+        "end": 9458328,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.8.mlp.c_proj.weight": {
+    "file": "layer_8.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 9458328,
+        "end": 14176920,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.9.attn.c_attn.bias": {
+    "file": "layer_9.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 1176,
+        "end": 5784,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.9.attn.c_attn.weight": {
+    "file": "layer_9.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 5784,
+        "end": 3544728,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.9.attn.c_proj.bias": {
+    "file": "layer_9.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 3544728,
+        "end": 3546264,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.9.attn.c_proj.weight": {
+    "file": "layer_9.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 3546264,
+        "end": 4725912,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.9.ln_1.bias": {
+    "file": "layer_9.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4725912,
+        "end": 4727448,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.9.ln_1.weight": {
+    "file": "layer_9.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4727448,
+        "end": 4728984,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.9.ln_2.bias": {
+    "file": "layer_9.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4728984,
+        "end": 4730520,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.9.ln_2.weight": {
+    "file": "layer_9.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4730520,
+        "end": 4732056,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.9.mlp.c_fc.bias": {
+    "file": "layer_9.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4732056,
+        "end": 4738200,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.9.mlp.c_fc.weight": {
+    "file": "layer_9.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4738200,
+        "end": 9456792,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.9.mlp.c_proj.bias": {
+    "file": "layer_9.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 9456792,
+        "end": 9458328,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.9.mlp.c_proj.weight": {
+    "file": "layer_9.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 9458328,
+        "end": 14176920,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.10.attn.c_attn.bias": {
+    "file": "layer_10.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 1184,
+        "end": 5792,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.10.attn.c_attn.weight": {
+    "file": "layer_10.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 5792,
+        "end": 3544736,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.10.attn.c_proj.bias": {
+    "file": "layer_10.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 3544736,
+        "end": 3546272,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.10.attn.c_proj.weight": {
+    "file": "layer_10.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 3546272,
+        "end": 4725920,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.10.ln_1.bias": {
+    "file": "layer_10.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4725920,
+        "end": 4727456,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.10.ln_1.weight": {
+    "file": "layer_10.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4727456,
+        "end": 4728992,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.10.ln_2.bias": {
+    "file": "layer_10.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4728992,
+        "end": 4730528,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.10.ln_2.weight": {
+    "file": "layer_10.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4730528,
+        "end": 4732064,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.10.mlp.c_fc.bias": {
+    "file": "layer_10.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4732064,
+        "end": 4738208,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.10.mlp.c_fc.weight": {
+    "file": "layer_10.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4738208,
+        "end": 9456800,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.10.mlp.c_proj.bias": {
+    "file": "layer_10.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 9456800,
+        "end": 9458336,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.10.mlp.c_proj.weight": {
+    "file": "layer_10.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 9458336,
+        "end": 14176928,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.11.attn.c_attn.bias": {
+    "file": "layer_11.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 1184,
+        "end": 5792,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.11.attn.c_attn.weight": {
+    "file": "layer_11.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 5792,
+        "end": 3544736,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.11.attn.c_proj.bias": {
+    "file": "layer_11.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 3544736,
+        "end": 3546272,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.11.attn.c_proj.weight": {
+    "file": "layer_11.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 3546272,
+        "end": 4725920,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.11.ln_1.bias": {
+    "file": "layer_11.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4725920,
+        "end": 4727456,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.11.ln_1.weight": {
+    "file": "layer_11.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4727456,
+        "end": 4728992,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.11.ln_2.bias": {
+    "file": "layer_11.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4728992,
+        "end": 4730528,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.11.ln_2.weight": {
+    "file": "layer_11.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4730528,
+        "end": 4732064,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.11.mlp.c_fc.bias": {
+    "file": "layer_11.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4732064,
+        "end": 4738208,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.11.mlp.c_fc.weight": {
+    "file": "layer_11.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 4738208,
+        "end": 9456800,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.11.mlp.c_proj.bias": {
+    "file": "layer_11.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 9456800,
+        "end": 9458336,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.h.11.mlp.c_proj.weight": {
+    "file": "layer_11.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 9458336,
+        "end": 14176928,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.ln_f.bias": {
+    "file": "norm.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 176,
+        "end": 1712,
+        "dtype": "F16"
+      }
+    }
+  },
+  "transformer.ln_f.weight": {
+    "file": "norm.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 1712,
+        "end": 3248,
+        "dtype": "F16"
+      }
+    }
+  },
+  "lm_head.weight": {
+    "file": "head.safetensors",
+    "tensors": {
+      "fp16": {
+        "start": 96,
+        "end": 77194848,
+        "dtype": "F16"
+      }
+    }
+  }
+}
