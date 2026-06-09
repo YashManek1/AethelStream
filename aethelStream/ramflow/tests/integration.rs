@@ -118,8 +118,7 @@ fn run_integration_body(profile_path: &PathBuf) {
         model_sha256: [0u8; 32],
     };
     let profiler = WarmupProfiler::new(warmup_config).expect("WarmupProfiler::new");
-    let [fwd_profile, bwd_profile, recomp_profile] =
-        profiler.run().expect("WarmupProfiler::run");
+    let [fwd_profile, bwd_profile, recomp_profile] = profiler.run().expect("WarmupProfiler::run");
 
     assert!(
         profile_path.exists(),
@@ -366,8 +365,7 @@ fn run_integration_body(profile_path: &PathBuf) {
         })
         .collect();
 
-    let fill_ratio =
-        registry.total_claimed_slots() as f32 / registry.total_capacity() as f32;
+    let fill_ratio = registry.total_claimed_slots() as f32 / registry.total_capacity() as f32;
     assert!(
         fill_ratio > 0.80,
         "pressure test setup: fill must exceed 80%, got {:.1}%",
@@ -411,7 +409,10 @@ fn run_integration_body(profile_path: &PathBuf) {
         low_callback_fired,
         "pressure gauge must fire low callback after all pressure slots released"
     );
-    assert!(!co.is_paused(), "CoScheduler pause must clear after low-pressure event");
+    assert!(
+        !co.is_paused(),
+        "CoScheduler pause must clear after low-pressure event"
+    );
     assert!(
         co.prefetch_window() > window_after_high,
         "prefetch window must recover after low-pressure event: during_high={window_after_high}, after={}",

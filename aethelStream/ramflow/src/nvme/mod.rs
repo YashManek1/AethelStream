@@ -8,7 +8,8 @@
 //   - prefetch() submits a real SQE and checks pause_signal.
 //   - poll_completions() drains the CQE ring.
 //   - start_cqe_poller() spawns the background CQE poller thread.
-//   - prewarm_first_n() and write_async() remain stubbed (Sprint 3+).
+//   - prewarm_first_n() remains a lightweight warm-up helper.
+//   - write_async() submits real write SQEs through the shared completion path.
 //
 // The pause_signal is an AtomicBool shared with:
 //   - CoScheduler (sets it on high-pressure callback)
@@ -76,7 +77,7 @@ mod engine {
         /// Checked before every SQE submission.
         pause_signal: Arc<AtomicBool>,
 
-        /// Count of reads submitted to io_uring and not yet seen as completions.
+        /// Count of read/write SQEs submitted to io_uring and not yet seen as completions.
         outstanding_reads: Arc<AtomicUsize>,
 
         /// Number of currently claimed pool slots tracked by scheduler.
@@ -162,13 +163,14 @@ mod engine {
             let pressure_threshold = Arc::new(AtomicUsize::new(usize::MAX));
 
             // --- Prefetch engine ---
-            let prefetch_engine = Arc::new(PrefetchEngine::new(
+            let prefetch_engine = Arc::new(PrefetchEngine::new_with_completion(
                 ring.clone(),
                 fd_table.clone(),
                 pause_signal.clone(),
                 outstanding_reads.clone(),
                 claimed_slots.clone(),
                 pressure_threshold.clone(),
+                completion_tx.clone(),
             )?);
 
             Ok(DirectNvmeEngine {
@@ -328,18 +330,21 @@ mod engine {
             )
         }
 
-        /// Submit an async write for `buf` to `shard_id` at `byte_offset`.
+        /// Submit an async write for `src` to `shard_id` at `byte_offset`.
         ///
         /// The write-budget manager intercepts this call when the `ssd-wear`
-        /// feature is active. Sprint 3 implementation.
-        #[allow(unused_variables)]
+        /// feature is active. The completion token is echoed through the same
+        /// CQE poller and channel used by reads.
         pub fn write_async(
             &self,
             shard_id: u32,
             byte_offset: u64,
-            buf: &PinnedBuffer,
+            length: u64,
+            src: &PinnedBuffer,
+            token: PrefetchToken,
         ) -> Result<()> {
-            unimplemented!("DirectNvmeEngine::write_async — Sprint 3 stub")
+            self.prefetch_engine
+                .schedule_write(shard_id, byte_offset, length, src, token)
         }
 
         /// Set the pause signal (called by the co-scheduler's high-pressure
@@ -365,7 +370,7 @@ mod engine {
             self.prefetch_engine.set_pressure_threshold(threshold);
         }
 
-        /// Expose current in-flight ring reads for co-scheduler decisions.
+        /// Expose current in-flight ring reads/writes for co-scheduler decisions.
         pub fn outstanding_reads(&self) -> usize {
             self.outstanding_reads.load(Ordering::Acquire)
         }
@@ -434,7 +439,7 @@ mod engine {
         /// the threshold, and true only after the ring has drained to ≤ threshold.
         #[test]
         fn is_pressure_relieved_false_when_reads_in_flight() {
-            let mut engine = DirectNvmeEngine::open_with_paths(&[]).expect("engine init failed");
+            let engine = DirectNvmeEngine::open_with_paths(&[]).expect("engine init failed");
             // Drive outstanding_reads above threshold so pressure is active.
             engine.set_pressure_threshold(4);
             // Simulate 10 in-flight reads by setting the atomic directly via

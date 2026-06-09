@@ -251,5 +251,3 @@ fn find_cuda_lib_dir() -> Option<PathBuf> {
     }
     None
 }
-
-

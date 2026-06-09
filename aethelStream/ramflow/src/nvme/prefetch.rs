@@ -57,6 +57,49 @@ use std::sync::{Arc, Mutex};
 /// Module 3 uses it as a tensor_id or a (layer_idx, tensor_name) hash.
 pub type PrefetchToken = u64;
 
+/// Sector alignment required by `O_DIRECT` for offsets, lengths, and buffers.
+pub const DIRECT_IO_ALIGNMENT: usize = 512;
+
+/// Validate the `O_DIRECT` triple: file offset, transfer length, and buffer address.
+pub fn validate_direct_io_alignment(
+    byte_offset: u64,
+    length: u64,
+    buffer_ptr: *const u8,
+) -> Result<()> {
+    if !byte_offset.is_multiple_of(DIRECT_IO_ALIGNMENT as u64) {
+        return Err(RamFlowError::IoUringError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "byte_offset {byte_offset} is not {DIRECT_IO_ALIGNMENT}-byte aligned \
+                 (O_DIRECT: offset must be a multiple of the sector size)"
+            ),
+        )));
+    }
+
+    if !length.is_multiple_of(DIRECT_IO_ALIGNMENT as u64) {
+        return Err(RamFlowError::IoUringError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "length {length} is not {DIRECT_IO_ALIGNMENT}-byte aligned \
+                 (O_DIRECT: length must be a multiple of the sector size)"
+            ),
+        )));
+    }
+
+    if !(buffer_ptr as usize).is_multiple_of(DIRECT_IO_ALIGNMENT) {
+        return Err(RamFlowError::IoUringError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "buffer address {:p} is not {DIRECT_IO_ALIGNMENT}-byte aligned \
+                 (O_DIRECT: buffer must be sector aligned)",
+                buffer_ptr
+            ),
+        )));
+    }
+
+    Ok(())
+}
+
 /// Configuration for super-shard grouped I/O.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SuperShardConfig {
@@ -127,6 +170,9 @@ pub struct PrefetchEngine {
 
     /// Grouped contiguous-read configuration. Default is disabled until profiled.
     super_shard_config: Mutex<SuperShardConfig>,
+
+    /// Completion sender used by correctness-first blocking fallback paths.
+    completion_tx: std::sync::mpsc::SyncSender<CqeResult>,
 }
 
 // Manual Send impl: all fields are Send individually.
@@ -147,6 +193,27 @@ impl PrefetchEngine {
         claimed_slots: Arc<AtomicUsize>,
         pressure_threshold: Arc<AtomicUsize>,
     ) -> Result<Self> {
+        let (completion_tx, _completion_rx) = std::sync::mpsc::sync_channel(1);
+        Self::new_with_completion(
+            ring,
+            fd_table,
+            pause_signal,
+            outstanding_reads,
+            claimed_slots,
+            pressure_threshold,
+            completion_tx,
+        )
+    }
+
+    pub(crate) fn new_with_completion(
+        ring: Arc<IoUringInstance>,
+        fd_table: Arc<FdTable>,
+        pause_signal: Arc<AtomicBool>,
+        outstanding_reads: Arc<AtomicUsize>,
+        claimed_slots: Arc<AtomicUsize>,
+        pressure_threshold: Arc<AtomicUsize>,
+        completion_tx: std::sync::mpsc::SyncSender<CqeResult>,
+    ) -> Result<Self> {
         Ok(PrefetchEngine {
             ring,
             fd_table,
@@ -155,6 +222,7 @@ impl PrefetchEngine {
             claimed_slots,
             pressure_threshold,
             super_shard_config: Mutex::new(SuperShardConfig::default()),
+            completion_tx,
         })
     }
 
@@ -163,7 +231,7 @@ impl PrefetchEngine {
     /// Returns Err(PressurePause) if the co-scheduler has raised the
     /// pause signal. The caller should sleep for one layer's compute time
     /// and retry.
-    fn check_pause(&self) -> Result<()> {
+    pub(crate) fn check_pause(&self) -> Result<()> {
         // Acquire pairs with the Release store in DirectNvmeEngine::set_pause().
         // On weakly-ordered architectures (ARM/RISC-V), Relaxed would allow the
         // CPU to see a stale false after the co-scheduler has stored true —
@@ -246,9 +314,14 @@ impl PrefetchEngine {
         token: PrefetchToken,
     ) -> Result<()> {
         self.check_pause()?;
+        validate_direct_io_alignment(byte_offset, length, dst.as_ptr())?;
+
+        #[cfg(feature = "libaio-fallback")]
+        if self.ring.is_libaio_fallback_active() {
+            return self.schedule_blocking_read(shard_id, byte_offset, length, dst, token);
+        }
 
         use io_uring::{opcode, types};
-        use std::os::unix::io::AsRawFd;
 
         let raw_fd = self.fd_table.get_raw_fd(shard_id).ok_or_else(|| {
             RamFlowError::ConfigError(format!("shard_id {shard_id} not registered in FdTable"))
@@ -299,28 +372,73 @@ impl PrefetchEngine {
         _token: PrefetchToken,
     ) -> Result<()> {
         self.check_pause()?;
+        validate_direct_io_alignment(byte_offset, _length, _dst.as_ptr())?;
 
-        // O_DIRECT sector-alignment gate: offset must be a multiple of 512.
-        if !byte_offset.is_multiple_of(512) {
-            return Err(RamFlowError::IoUringError(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "byte_offset {byte_offset} is not 512-byte aligned \
-                     (O_DIRECT: offset must be a multiple of the sector size)"
-                ),
-            )));
+        self.outstanding_reads.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Schedule a write of `length` bytes from `src` into `shard_id`.
+    ///
+    /// Uses the same pause gate, completion token, and outstanding-I/O counter
+    /// as read prefetches so the existing CQE poller and channel retire both
+    /// reads and writes uniformly.
+    #[cfg(target_os = "linux")]
+    pub fn schedule_write(
+        &self,
+        shard_id: u32,
+        byte_offset: u64,
+        length: u64,
+        src: &PinnedBuffer,
+        token: PrefetchToken,
+    ) -> Result<()> {
+        self.check_pause()?;
+        validate_direct_io_alignment(byte_offset, length, src.as_ptr())?;
+
+        #[cfg(feature = "libaio-fallback")]
+        if self.ring.is_libaio_fallback_active() {
+            return self.schedule_blocking_write(shard_id, byte_offset, length, src, token);
         }
 
-        if !_length.is_multiple_of(512) {
-            return Err(RamFlowError::IoUringError(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "length {_length} is not 512-byte aligned \
-                     (O_DIRECT: length must be a multiple of the sector size)"
-                ),
-            )));
-        }
+        use io_uring::{opcode, types};
 
+        let raw_fd = self.fd_table.get_write_raw_fd(shard_id)?;
+        let write_op = opcode::Write::new(types::Fd(raw_fd), src.as_ptr(), length as u32)
+            .offset(byte_offset)
+            .build()
+            .user_data(token);
+
+        // SAFETY: The SQE references `src`; the caller must keep it alive until
+        // the matching CQE arrives, exactly like read prefetch destinations.
+        self.ring.with_submission(|submission_queue| {
+            unsafe {
+                submission_queue.push(&write_op).map_err(|_| {
+                    RamFlowError::IoUringError(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "io_uring submission queue full",
+                    ))
+                })?;
+            }
+            Ok(())
+        })?;
+
+        self.ring.submit()?;
+        self.outstanding_reads.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Non-Linux stub: io_uring write submission is unavailable.
+    #[cfg(not(target_os = "linux"))]
+    pub fn schedule_write(
+        &self,
+        _shard_id: u32,
+        byte_offset: u64,
+        length: u64,
+        src: &PinnedBuffer,
+        _token: PrefetchToken,
+    ) -> Result<()> {
+        self.check_pause()?;
+        validate_direct_io_alignment(byte_offset, length, src.as_ptr())?;
         self.outstanding_reads.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
@@ -346,6 +464,83 @@ impl PrefetchEngine {
         }
 
         self.schedule(shard_id, byte_offset, length, dst, token)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "libaio-fallback"))]
+    fn schedule_blocking_read(
+        &self,
+        shard_id: u32,
+        byte_offset: u64,
+        length: u64,
+        dst: &PinnedBuffer,
+        token: PrefetchToken,
+    ) -> Result<()> {
+        let raw_fd = self.fd_table.get_raw_fd(shard_id).ok_or_else(|| {
+            RamFlowError::ConfigError(format!("shard_id {shard_id} not registered in FdTable"))
+        })?;
+        self.outstanding_reads.fetch_add(1, Ordering::AcqRel);
+        let result = unsafe {
+            // Safety: direct-I/O alignment and destination lifetime are validated
+            // by the caller path before entering this fallback.
+            libc::pread(
+                raw_fd,
+                dst.as_ptr() as *mut libc::c_void,
+                length as usize,
+                byte_offset as libc::off_t,
+            )
+        };
+        self.complete_blocking_fallback(token, result)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "libaio-fallback"))]
+    fn schedule_blocking_write(
+        &self,
+        shard_id: u32,
+        byte_offset: u64,
+        length: u64,
+        src: &PinnedBuffer,
+        token: PrefetchToken,
+    ) -> Result<()> {
+        let raw_fd = self.fd_table.get_write_raw_fd(shard_id)?;
+        self.outstanding_reads.fetch_add(1, Ordering::AcqRel);
+        let result = unsafe {
+            // Safety: direct-I/O alignment and source lifetime are validated by
+            // the caller path before entering this fallback.
+            libc::pwrite(
+                raw_fd,
+                src.as_ptr() as *const libc::c_void,
+                length as usize,
+                byte_offset as libc::off_t,
+            )
+        };
+        self.complete_blocking_fallback(token, result)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "libaio-fallback"))]
+    fn complete_blocking_fallback(&self, token: PrefetchToken, result: isize) -> Result<()> {
+        let prior = self.outstanding_reads.load(Ordering::Acquire);
+        if prior > 0 {
+            self.outstanding_reads.fetch_sub(1, Ordering::AcqRel);
+        }
+        let cqe_result = if result < 0 {
+            CqeResult {
+                token,
+                result: -std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            }
+        } else {
+            CqeResult {
+                token,
+                result: result as i32,
+            }
+        };
+        self.completion_tx.send(cqe_result).map_err(|_| {
+            RamFlowError::IoUringError(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "completion receiver dropped during libaio-fallback operation",
+            ))
+        })
     }
 }
 
@@ -499,6 +694,7 @@ fn pin_thread_to_core(cpu_core: usize) {
 mod tests {
     use super::*;
     use crate::nvme::io_uring_setup::IoUringParams;
+    #[cfg(target_os = "linux")]
     use std::io::Write;
 
     /// Build an open-gate PrefetchEngine (pressure threshold = MAX, gate open).
@@ -667,15 +863,12 @@ mod tests {
         let mut fd_table = FdTable::new().unwrap();
         // Register without O_DIRECT for test hermiticity.
         {
-            use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
+            use std::os::unix::io::IntoRawFd;
             let f = OpenOptions::new().read(true).open(&tmp_path).unwrap();
             let raw = f.into_raw_fd();
-            // We have to manually insert since register() uses O_DIRECT.
-            // In production, register() is used; here we directly insert.
-            // This is acceptable for the test: we're testing the io_uring
-            // SQE/CQE path, not the O_DIRECT open.
-            fd_table.fds.insert(0, unsafe { OwnedFd::from_raw_fd(raw) });
-            fd_table.count = 1;
+            // This test bypasses O_DIRECT because it exercises the io_uring
+            // SQE/CQE path, not raw-device open flags.
+            fd_table.register_read_fd_for_test(0, raw, &tmp_path);
         }
 
         let ring = Arc::new(
@@ -739,6 +932,64 @@ mod tests {
             expected.as_slice(),
             "io_uring read data does not match fread() reference"
         );
+
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "libaio-fallback"))]
+    fn libaio_fallback_read_emits_completion_and_matches_bytes() {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::io::IntoRawFd;
+
+        let tmp_path = std::path::PathBuf::from(format!(
+            "/tmp/ramflow_libaio_fallback_{}",
+            std::process::id()
+        ));
+        let expected = vec![0xA5_u8; 512];
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)
+                .expect("create fallback temp file");
+            file.write_all(&expected).expect("write fallback fixture");
+            file.sync_all().expect("sync fallback fixture");
+        }
+
+        let mut fd_table = FdTable::new().expect("fd table");
+        let file = OpenOptions::new()
+            .read(true)
+            .open(&tmp_path)
+            .expect("open fallback temp file");
+        fd_table.register_read_fd_for_test(0, file.into_raw_fd(), &tmp_path);
+
+        let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(4);
+        let engine = PrefetchEngine::new_with_completion(
+            Arc::new(IoUringInstance::libaio_fallback_for_test()),
+            Arc::new(fd_table),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(usize::MAX)),
+            completion_tx,
+        )
+        .expect("fallback prefetch engine");
+
+        let dst = PinnedBuffer::alloc(512).expect("fallback dst");
+        let token = 0xF411_BACC;
+        engine
+            .schedule(0, 0, 512, &dst, token)
+            .expect("fallback schedule");
+        let completion = completion_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("fallback completion");
+
+        assert_eq!(completion.token, token);
+        assert_eq!(completion.result, 512);
+        assert_eq!(&dst.as_slice()[..512], expected.as_slice());
 
         let _ = std::fs::remove_file(&tmp_path);
     }

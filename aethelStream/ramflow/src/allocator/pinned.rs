@@ -276,14 +276,15 @@ impl PinnedBuffer {
         // SAFETY: ptr is non-null, aligned to 64 bytes, allocated by
         // posix_memalign, and `bytes` matches the allocation size.
         unsafe {
-            cuda_host_register(ptr as *mut c_void, bytes, CUDA_HOST_REGISTER_DEFAULT)
-                .inspect_err(|_| {
+            cuda_host_register(ptr as *mut c_void, bytes, CUDA_HOST_REGISTER_DEFAULT).inspect_err(
+                |_| {
                     // Registration failed: free immediately to avoid a leak.
                     // Drop impl would not call unregister since registration
                     // never succeeded.
                     // SAFETY: ptr was returned by posix_memalign_alloc.
                     platform::free_aligned(ptr);
-                })?;
+                },
+            )?;
         }
 
         Ok(Self {
@@ -319,11 +320,12 @@ impl PinnedBuffer {
 
         // SAFETY: Same as alloc. Flag is MAPPED for UVA.
         unsafe {
-            cuda_host_register(ptr as *mut c_void, bytes, CUDA_HOST_REGISTER_MAPPED)
-                .inspect_err(|_| {
+            cuda_host_register(ptr as *mut c_void, bytes, CUDA_HOST_REGISTER_MAPPED).inspect_err(
+                |_| {
                     // SAFETY: ptr was returned by posix_memalign_alloc.
                     platform::free_aligned(ptr);
-                })?;
+                },
+            )?;
         }
 
         Ok(Self {

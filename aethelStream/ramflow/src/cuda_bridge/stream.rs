@@ -8,6 +8,8 @@
 // In mock-cuda mode, check_overflow_fp16 is a pure-Rust stub that scans the
 // host-side slice directly. This lets all Sprint 2 tests run on CI without a GPU.
 
+#[cfg(not(feature = "mock-cuda"))]
+use crate::error::RamFlowError;
 use crate::Result;
 
 // ===========================================================================
@@ -110,12 +112,107 @@ impl Drop for CudaStream {
 /// blocking the whole stream.
 pub struct OverflowCheckToken {
     immediate_result: Option<bool>,
+    #[cfg(not(feature = "mock-cuda"))]
+    event: *mut std::os::raw::c_void,
+    #[cfg(not(feature = "mock-cuda"))]
+    host_result: *mut bool,
 }
 
 impl OverflowCheckToken {
+    /// Poll the overflow check without blocking the CUDA stream.
+    pub fn poll(&self) -> Option<bool> {
+        if let Some(result) = self.immediate_result {
+            return Some(result);
+        }
+
+        #[cfg(not(feature = "mock-cuda"))]
+        {
+            if self.event.is_null() || self.host_result.is_null() {
+                return Some(false);
+            }
+
+            // Safety: `event` is created by `cudaEventCreateWithFlags` and remains
+            // owned by this token. `host_result` points to pinned host memory that
+            // is not freed until the event has completed.
+            let query_result = unsafe { cuda_event_query(self.event) };
+            if query_result == CUDA_SUCCESS {
+                // Safety: successful event completion means the queued D2H copy
+                // into `host_result` has completed on the same stream.
+                return Some(unsafe { *self.host_result });
+            }
+            if query_result == CUDA_ERROR_NOT_READY {
+                return None;
+            }
+            return Some(false);
+        }
+
+        #[cfg(feature = "mock-cuda")]
+        {
+            Some(false)
+        }
+    }
+
     /// Resolve the overflow check result.
     pub fn complete(self) -> bool {
-        self.immediate_result.unwrap_or(false)
+        if let Some(result) = self.immediate_result {
+            return result;
+        }
+
+        #[cfg(not(feature = "mock-cuda"))]
+        {
+            let mut token = self;
+            loop {
+                match token.poll() {
+                    Some(result) => {
+                        token.release_cuda_resources();
+                        return result;
+                    }
+                    None => std::thread::yield_now(),
+                }
+            }
+        }
+
+        #[cfg(feature = "mock-cuda")]
+        {
+            false
+        }
+    }
+
+    #[cfg(not(feature = "mock-cuda"))]
+    fn release_cuda_resources(&mut self) {
+        if !self.event.is_null() {
+            // Safety: the event handle was created by `cudaEventCreateWithFlags`
+            // and is owned exclusively by this token.
+            unsafe {
+                let _ = cuda_event_destroy(self.event);
+            }
+            self.event = std::ptr::null_mut();
+        }
+        if !self.host_result.is_null() {
+            // Safety: `host_result` was allocated by `cudaMallocHost` and is
+            // released only after event completion or launch failure before use.
+            unsafe {
+                let _ = cuda_free_host(self.host_result as *mut std::os::raw::c_void);
+            }
+            self.host_result = std::ptr::null_mut();
+        }
+    }
+}
+
+#[cfg(not(feature = "mock-cuda"))]
+impl Drop for OverflowCheckToken {
+    fn drop(&mut self) {
+        if self.immediate_result.is_none() && !self.event.is_null() {
+            loop {
+                // Safety: `event` is a live CUDA event owned by this token.
+                let query_result = unsafe { cuda_event_query(self.event) };
+                if query_result != CUDA_ERROR_NOT_READY {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+        self.release_cuda_resources();
     }
 }
 
@@ -139,6 +236,10 @@ pub fn launch_overflow_check_fp16_async(
     if n == 0 {
         return OverflowCheckToken {
             immediate_result: Some(false),
+            #[cfg(not(feature = "mock-cuda"))]
+            event: std::ptr::null_mut(),
+            #[cfg(not(feature = "mock-cuda"))]
+            host_result: std::ptr::null_mut(),
         };
     }
 
@@ -156,7 +257,94 @@ pub fn launch_overflow_check_fp16_async(
 
     #[cfg(not(feature = "mock-cuda"))]
     {
-        todo!("Real CUDA async path — Sprint 4: post kernel + record event; complete() waits on event")
+        let element_count = match i32::try_from(n) {
+            Ok(element_count) => element_count,
+            Err(_) => {
+                return OverflowCheckToken {
+                    immediate_result: Some(false),
+                    event: std::ptr::null_mut(),
+                    host_result: std::ptr::null_mut(),
+                };
+            }
+        };
+
+        let mut host_result: *mut bool = std::ptr::null_mut();
+        let host_alloc_result = unsafe {
+            // Safety: CUDA writes one pointer-sized output slot on success.
+            cuda_malloc_host(
+                &mut host_result as *mut *mut bool as *mut *mut std::os::raw::c_void,
+                std::mem::size_of::<bool>(),
+            )
+        };
+        if host_alloc_result != CUDA_SUCCESS {
+            return OverflowCheckToken {
+                immediate_result: Some(false),
+                event: std::ptr::null_mut(),
+                host_result: std::ptr::null_mut(),
+            };
+        }
+
+        // Safety: `host_result` points to a live pinned bool allocated above.
+        unsafe {
+            *host_result = false;
+        }
+
+        let mut event: *mut std::os::raw::c_void = std::ptr::null_mut();
+        let event_create_result = unsafe {
+            // Safety: CUDA writes one event handle slot on success.
+            cuda_event_create_with_flags(&mut event, CUDA_EVENT_DISABLE_TIMING)
+        };
+        if event_create_result != CUDA_SUCCESS {
+            unsafe {
+                let _ = cuda_free_host(host_result as *mut std::os::raw::c_void);
+            }
+            return OverflowCheckToken {
+                immediate_result: Some(false),
+                event: std::ptr::null_mut(),
+                host_result: std::ptr::null_mut(),
+            };
+        }
+
+        let launch_result = unsafe {
+            // Safety: caller guarantees `grad_ptr` is a device pointer valid for
+            // `element_count` FP16 elements; `host_result` is pinned host memory.
+            ramflow_launch_overflow_check_fp16_async(
+                grad_ptr as *const std::os::raw::c_void,
+                element_count,
+                _stream.as_raw(),
+                host_result,
+            )
+        };
+        if launch_result != CUDA_SUCCESS {
+            unsafe {
+                let _ = cuda_event_destroy(event);
+                let _ = cuda_free_host(host_result as *mut std::os::raw::c_void);
+            }
+            return OverflowCheckToken {
+                immediate_result: Some(false),
+                event: std::ptr::null_mut(),
+                host_result: std::ptr::null_mut(),
+            };
+        }
+
+        let record_result = unsafe {
+            // Safety: `event` and stream are live; all prior operations on this
+            // stream must complete before this event becomes query-ready.
+            cuda_event_record(event, _stream.as_raw())
+        };
+        if record_result != CUDA_SUCCESS {
+            return OverflowCheckToken {
+                immediate_result: Some(false),
+                event,
+                host_result,
+            };
+        }
+
+        OverflowCheckToken {
+            immediate_result: None,
+            event,
+            host_result,
+        }
     }
 }
 
@@ -183,10 +371,11 @@ pub fn launch_overflow_check_fp16_async(
 /// # Returns
 /// `true` if any element is NaN or Inf, `false` otherwise.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[cfg_attr(feature = "mock-cuda", allow(unused_variables))]
 pub fn check_overflow_fp16(
     grad_ptr: *const u16, // FP16 stored as u16 bits; avoids half-float dep in Rust
     n: usize,
-    _stream: &CudaStream,
+    stream: &CudaStream,
 ) -> bool {
     if n == 0 {
         return false;
@@ -232,13 +421,42 @@ extern "C" {
         stream: *mut std::os::raw::c_void,
     ) -> bool;
 
+    // From kernels/overflow_check.cu
+    fn ramflow_launch_overflow_check_fp16_async(
+        grad_device: *const std::os::raw::c_void,
+        n: i32,
+        stream: *mut std::os::raw::c_void,
+        host_result: *mut bool,
+    ) -> i32;
+
     // From libcudart — stream lifecycle
     fn cudaStreamCreateWithFlags(stream: *mut *mut std::os::raw::c_void, flags: u32) -> i32;
 
     fn cudaStreamSynchronize(stream: *mut std::os::raw::c_void) -> i32;
 
     fn cudaStreamDestroy(stream: *mut std::os::raw::c_void) -> i32;
+
+    fn cudaEventCreateWithFlags(event: *mut *mut std::os::raw::c_void, flags: u32) -> i32;
+
+    fn cudaEventRecord(event: *mut std::os::raw::c_void, stream: *mut std::os::raw::c_void) -> i32;
+
+    fn cudaEventQuery(event: *mut std::os::raw::c_void) -> i32;
+
+    fn cudaEventDestroy(event: *mut std::os::raw::c_void) -> i32;
+
+    fn cudaMallocHost(ptr: *mut *mut std::os::raw::c_void, size: usize) -> i32;
+
+    fn cudaFreeHost(ptr: *mut std::os::raw::c_void) -> i32;
 }
+
+#[cfg(not(feature = "mock-cuda"))]
+const CUDA_SUCCESS: i32 = 0;
+
+#[cfg(not(feature = "mock-cuda"))]
+const CUDA_ERROR_NOT_READY: i32 = 34;
+
+#[cfg(not(feature = "mock-cuda"))]
+const CUDA_EVENT_DISABLE_TIMING: u32 = 2;
 
 // Thin wrappers so the Rust code above doesn't need raw unsafe in-line.
 // These just exist to give the extern functions nicer names at the call site.
@@ -258,6 +476,39 @@ unsafe fn cuda_stream_destroy(stream: *mut std::os::raw::c_void) -> i32 {
     cudaStreamDestroy(stream)
 }
 
+#[cfg(not(feature = "mock-cuda"))]
+unsafe fn cuda_event_create_with_flags(event: *mut *mut std::os::raw::c_void, flags: u32) -> i32 {
+    cudaEventCreateWithFlags(event, flags)
+}
+
+#[cfg(not(feature = "mock-cuda"))]
+unsafe fn cuda_event_record(
+    event: *mut std::os::raw::c_void,
+    stream: *mut std::os::raw::c_void,
+) -> i32 {
+    cudaEventRecord(event, stream)
+}
+
+#[cfg(not(feature = "mock-cuda"))]
+unsafe fn cuda_event_query(event: *mut std::os::raw::c_void) -> i32 {
+    cudaEventQuery(event)
+}
+
+#[cfg(not(feature = "mock-cuda"))]
+unsafe fn cuda_event_destroy(event: *mut std::os::raw::c_void) -> i32 {
+    cudaEventDestroy(event)
+}
+
+#[cfg(not(feature = "mock-cuda"))]
+unsafe fn cuda_malloc_host(ptr: *mut *mut std::os::raw::c_void, size: usize) -> i32 {
+    cudaMallocHost(ptr, size)
+}
+
+#[cfg(not(feature = "mock-cuda"))]
+unsafe fn cuda_free_host(ptr: *mut std::os::raw::c_void) -> i32 {
+    cudaFreeHost(ptr)
+}
+
 // ===========================================================================
 // Tests (mock-cuda only, run on CI without a GPU)
 // ===========================================================================
@@ -274,7 +525,6 @@ unsafe fn cuda_stream_destroy(stream: *mut std::os::raw::c_void) -> i32 {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use std::mem::ManuallyDrop;
 
     // Helper: build a u16 that represents a valid FP16 value.
     // 1.0 in FP16: sign=0, exp=01111 (15, biased), mantissa=0 → 0x3C00

@@ -70,6 +70,29 @@ bool ramflow_check_overflow_fp16(
     cudaStream_t  stream
 );
 
+// ---------------------------------------------------------------------------
+// ramflow_launch_overflow_check_fp16_async
+// ---------------------------------------------------------------------------
+// Host-callable C wrapper used by Rust's OverflowCheckToken path.
+// Enqueues flag zeroing, kernel launch, device-to-host result copy, and async
+// device-flag free on `stream`. The Rust token records a CUDA event after this
+// call and polls that event before reading `host_result`.
+//
+// Parameters:
+//   grad_device : device pointer to FP16 gradient tensor
+//   n           : number of elements
+//   stream      : CUDA stream to launch on
+//   host_result : pinned host bool that receives the copied result
+//
+// Returns:
+//   cudaSuccess on successful enqueue; otherwise the CUDA runtime error code.
+int ramflow_launch_overflow_check_fp16_async(
+    const __half* grad_device,
+    int           n,
+    cudaStream_t  stream,
+    bool*         host_result
+);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

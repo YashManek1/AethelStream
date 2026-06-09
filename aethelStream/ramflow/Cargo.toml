@@ -29,16 +29,16 @@ cuda      = ["dep:io-uring"]
 # Keep this off for best performance; enable for compatibility/debugging.
 io-uring-use-split = []
 
+# Correctness-first fallback for Linux systems where io_uring setup fails.
+# Uses blocking pread/pwrite on the submission path and emits normal completions.
+libaio-fallback = []
+
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
 [dependencies]
 # Structured diagnostics & Display for RamFlowError
 thiserror = "1"
-
-# io_uring bindings (used by DirectNvmeEngine)
-# Pinned to 0.7.11 because this code path uses submission_shared/completion_shared.
-io-uring  = { version = "=0.7.11", optional = true }
 
 # Atomic primitives beyond std
 crossbeam-utils = "0.8"
@@ -59,6 +59,11 @@ windows-sys = { version = "0.52", features = [
     "Win32_System_Memory"
 ] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# io_uring bindings (used by DirectNvmeEngine)
+# Pinned to 0.7.11 because this code path uses submission_shared/completion_shared.
+io-uring  = { version = "=0.7.11", optional = true }
+
 [build-dependencies]
 # nothing beyond std — we shell out to nvcc manually in build.rs
 
@@ -66,4 +71,8 @@ windows-sys = { version = "0.52", features = [
 # Dev-dependencies (integration tests under ramflow/tests/)
 # ---------------------------------------------------------------------------
 [dev-dependencies]
-# nothing yet – stubs only for Sprint 0
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "ramflow_bench"
+harness = false

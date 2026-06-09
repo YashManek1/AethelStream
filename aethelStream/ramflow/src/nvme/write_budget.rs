@@ -171,47 +171,47 @@ impl SmartSource for NvmeSmartReader {
 
         #[repr(C)]
         struct NvmeAdminCmd {
-            opcode:       u8,
-            flags:        u8,
-            rsvd1:        u16,
-            nsid:         u32,
-            cdw2:         u32,
-            cdw3:         u32,
-            metadata:     u64,
-            addr:         u64,
+            opcode: u8,
+            flags: u8,
+            rsvd1: u16,
+            nsid: u32,
+            cdw2: u32,
+            cdw3: u32,
+            metadata: u64,
+            addr: u64,
             metadata_len: u32,
-            data_len:     u32,
-            cdw10:        u32,
-            cdw11:        u32,
-            cdw12:        u32,
-            cdw13:        u32,
-            cdw14:        u32,
-            cdw15:        u32,
-            timeout_ms:   u32,
-            result:       u32,
+            data_len: u32,
+            cdw10: u32,
+            cdw11: u32,
+            cdw12: u32,
+            cdw13: u32,
+            cdw14: u32,
+            cdw15: u32,
+            timeout_ms: u32,
+            result: u32,
         }
 
         let mut log_buf = [0u8; 512];
 
         let mut cmd = NvmeAdminCmd {
-            opcode:       GET_LOG_PAGE_OPCODE,
-            flags:        0,
-            rsvd1:        0,
-            nsid:         0xFFFF_FFFF, // global namespace
-            cdw2:         0,
-            cdw3:         0,
-            metadata:     0,
-            addr:         log_buf.as_mut_ptr() as u64,
+            opcode: GET_LOG_PAGE_OPCODE,
+            flags: 0,
+            rsvd1: 0,
+            nsid: 0xFFFF_FFFF, // global namespace
+            cdw2: 0,
+            cdw3: 0,
+            metadata: 0,
+            addr: log_buf.as_mut_ptr() as u64,
             metadata_len: 0,
-            data_len:     SMART_LOG_SIZE,
+            data_len: SMART_LOG_SIZE,
             cdw10,
-            cdw11:        0,
-            cdw12:        0,
-            cdw13:        0,
-            cdw14:        0,
-            cdw15:        0,
-            timeout_ms:   5_000,
-            result:       0,
+            cdw11: 0,
+            cdw12: 0,
+            cdw13: 0,
+            cdw14: 0,
+            cdw15: 0,
+            timeout_ms: 5_000,
+            result: 0,
         };
 
         let file = OpenOptions::new()
@@ -229,8 +229,7 @@ impl SmartSource for NvmeSmartReader {
         // - `cmd.addr` holds the address of `log_buf`, a 512-byte stack array.
         // - The kernel writes at most `cmd.data_len` (512) bytes into `log_buf`.
         // - The ioctl returns synchronously; `log_buf` is valid for its full lifetime.
-        let ioctl_result =
-            unsafe { libc::ioctl(file.as_raw_fd(), NVME_IOCTL_ADMIN_CMD, &mut cmd) };
+        let ioctl_result = unsafe { libc::ioctl(file.as_raw_fd(), NVME_IOCTL_ADMIN_CMD, &mut cmd) };
         if ioctl_result < 0 {
             return Err(crate::RamFlowError::IoUringError(
                 std::io::Error::last_os_error(),
@@ -259,6 +258,9 @@ struct DeferredEntry {
     /// Bytes to flush — may be a full shard or a delta-compressed payload.
     payload: Vec<u8>,
 }
+
+#[cfg(feature = "ssd-wear")]
+type BudgetCallback = Box<dyn Fn(u64, u64) + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // WriteBudgetManager — ssd-wear ACTIVE path
@@ -296,7 +298,7 @@ pub struct WriteBudgetManager {
     /// Source for SMART telemetry reads (injectable for tests).
     smart_source: Box<dyn SmartSource>,
     /// Optional callback: `fn(remaining_units, budget_units)` — fired below 20%.
-    budget_callback: Mutex<Option<Box<dyn Fn(u64, u64) + Send + Sync>>>,
+    budget_callback: Mutex<Option<BudgetCallback>>,
     /// Deferred write queue.  Flushed once `batch_size` entries accumulate.
     deferred_queue: Mutex<Vec<DeferredEntry>>,
 }
@@ -306,11 +308,11 @@ pub struct WriteBudgetManager {
 /// All methods compile to nothing — zero overhead on the critical training path.
 #[cfg(not(feature = "ssd-wear"))]
 pub struct WriteBudgetManager {
-    _device_path:    PathBuf,
+    _device_path: PathBuf,
     _units_at_start: u64,
-    _budget_units:   u64,
-    _units_written:  AtomicU64,
-    _strategy:       WriteStrategy,
+    _budget_units: u64,
+    _units_written: AtomicU64,
+    _strategy: WriteStrategy,
 }
 
 // ---------------------------------------------------------------------------
@@ -330,8 +332,9 @@ impl WriteBudgetManager {
         #[cfg(feature = "ssd-wear")]
         {
             #[cfg(target_os = "linux")]
-            let source: Box<dyn SmartSource> =
-                Box::new(NvmeSmartReader { device_path: device_path.clone() });
+            let source: Box<dyn SmartSource> = Box::new(NvmeSmartReader {
+                device_path: device_path.clone(),
+            });
             #[cfg(not(target_os = "linux"))]
             let source: Box<dyn SmartSource> = Box::new(ZeroSmartSource);
             WriteBudgetManager::new_with_source(device_path, budget_bytes, source)
@@ -339,11 +342,11 @@ impl WriteBudgetManager {
         #[cfg(not(feature = "ssd-wear"))]
         {
             WriteBudgetManager {
-                _device_path:    device_path,
+                _device_path: device_path,
                 _units_at_start: 0,
-                _budget_units:   u64::MAX,
-                _units_written:  AtomicU64::new(0),
-                _strategy:       WriteStrategy::Full,
+                _budget_units: u64::MAX,
+                _units_written: AtomicU64::new(0),
+                _strategy: WriteStrategy::Full,
             }
         }
     }
@@ -517,10 +520,7 @@ impl WriteBudgetManager {
     /// Default behaviour when no callback is set: `WearBudgetExceeded` is
     /// returned by `consume()` once budget is exhausted — no other signalling.
     #[allow(unused_variables)]
-    pub fn set_budget_warning_callback(
-        &self,
-        callback: impl Fn(u64, u64) + Send + Sync + 'static,
-    ) {
+    pub fn set_budget_warning_callback(&self, callback: impl Fn(u64, u64) + Send + Sync + 'static) {
         #[cfg(feature = "ssd-wear")]
         {
             *self
@@ -627,24 +627,20 @@ pub fn compress_delta(
     // Compute LE i16 delta: delta[i] = updated_i16[i] - original_i16[i] (wrapping).
     // Wrapping arithmetic guarantees bit-exact round-trip:
     //   original_i16[i] + delta_i16[i] (wrapping) == updated_i16[i].
-    let mut delta_bytes: Vec<u8> =
-        Vec::with_capacity(updated.len());
+    let mut delta_bytes: Vec<u8> = Vec::with_capacity(updated.len());
     for chunk_index in 0..(updated.len() / 2) {
         let byte_index = chunk_index * 2;
-        let updated_val =
-            i16::from_le_bytes([updated[byte_index], updated[byte_index + 1]]);
-        let original_val =
-            i16::from_le_bytes([original[byte_index], original[byte_index + 1]]);
+        let updated_val = i16::from_le_bytes([updated[byte_index], updated[byte_index + 1]]);
+        let original_val = i16::from_le_bytes([original[byte_index], original[byte_index + 1]]);
         let delta_val = updated_val.wrapping_sub(original_val);
         let delta_le = delta_val.to_le_bytes();
         delta_bytes.push(delta_le[0]);
         delta_bytes.push(delta_le[1]);
     }
     // Handle any trailing odd byte (should not occur for FP16, guarded defensively).
-    if updated.len() % 2 != 0 {
+    if !updated.len().is_multiple_of(2) {
         let last = updated.len() - 1;
-        let trailing_delta =
-            (updated[last] as i8).wrapping_sub(original[last] as i8) as u8;
+        let trailing_delta = (updated[last] as i8).wrapping_sub(original[last] as i8) as u8;
         delta_bytes.push(trailing_delta);
     }
 
@@ -716,20 +712,17 @@ pub fn decompress_and_apply_delta(
     let mut updated = vec![0u8; original.len()];
     for chunk_index in 0..(original.len() / 2) {
         let byte_index = chunk_index * 2;
-        let orig_val =
-            i16::from_le_bytes([original[byte_index], original[byte_index + 1]]);
-        let delta_val =
-            i16::from_le_bytes([delta_bytes[byte_index], delta_bytes[byte_index + 1]]);
+        let orig_val = i16::from_le_bytes([original[byte_index], original[byte_index + 1]]);
+        let delta_val = i16::from_le_bytes([delta_bytes[byte_index], delta_bytes[byte_index + 1]]);
         let updated_val = orig_val.wrapping_add(delta_val);
         let updated_le = updated_val.to_le_bytes();
         updated[byte_index] = updated_le[0];
         updated[byte_index + 1] = updated_le[1];
     }
     // Handle any trailing odd byte.
-    if original.len() % 2 != 0 {
+    if !original.len().is_multiple_of(2) {
         let last = original.len() - 1;
-        updated[last] =
-            (original[last] as i8).wrapping_add(delta_bytes[last] as i8) as u8;
+        updated[last] = (original[last] as i8).wrapping_add(delta_bytes[last] as i8) as u8;
     }
 
     Ok(updated)

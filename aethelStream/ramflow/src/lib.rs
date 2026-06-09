@@ -77,6 +77,12 @@ pub mod kernels;
 pub mod scheduler;
 
 // ---------------------------------------------------------------------------
+// Emergency checkpointing — opt-in signal hook
+// ---------------------------------------------------------------------------
+/// Opt-in emergency checkpoint hook for SIGTERM/SIGINT shutdown paths.
+pub mod emergency;
+
+// ---------------------------------------------------------------------------
 // Primary re-exports — what 95% of callers need
 // ---------------------------------------------------------------------------
 

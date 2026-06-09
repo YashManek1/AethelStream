@@ -39,7 +39,7 @@ impl PhaseRebalancer {
         PhaseRebalancer {
             registry: Some(registry),
             outstanding_cuda_copies: Arc::new(AtomicUsize::new(0)),
-            fence_timeout: Duration::from_secs(30),
+            fence_timeout: debug_fence_timeout_override().unwrap_or(Duration::from_secs(30)),
         }
     }
 
@@ -120,6 +120,19 @@ impl Default for PhaseRebalancer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[cfg(debug_assertions)]
+fn debug_fence_timeout_override() -> Option<Duration> {
+    std::env::var("RAMFLOW_PHASE_FENCE_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+}
+
+#[cfg(not(debug_assertions))]
+fn debug_fence_timeout_override() -> Option<Duration> {
+    None
 }
 
 #[cfg(test)]

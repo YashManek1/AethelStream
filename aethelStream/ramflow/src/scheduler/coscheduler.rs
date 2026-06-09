@@ -50,8 +50,8 @@ pub struct PerLayerScaleTable {
     /// Current per-layer loss scale (init 65536.0, floor 1.0, cap 65536.0).
     scale: Vec<f32>,
 
-    /// Running mean of gradient magnitude per layer (Idea 1 signal for Module 3).
-    gradient_variance: Vec<f32>,
+    /// Windowed mean of gradient magnitude per layer (Idea 1 signal for Module 3).
+    gradient_variance: Vec<GradientVarianceWindow>,
 
     /// Hot-set caching flags — true means Module 3 should keep this layer resident.
     resident: Vec<bool>,
@@ -68,6 +68,45 @@ pub struct PerLayerScaleTable {
     /// When true (Ampere+ with BF16 mode active), skip overflow scaling entirely
     /// and fix all scales at 1.0 — BF16 has native NaN/Inf immunity.
     bf16_mode: bool,
+}
+
+#[derive(Clone)]
+struct GradientVarianceWindow {
+    samples: Vec<f32>,
+    next: usize,
+    len: usize,
+    sum: f32,
+}
+
+impl GradientVarianceWindow {
+    fn new(capacity: usize) -> Self {
+        Self {
+            samples: vec![0.0; capacity.max(1)],
+            next: 0,
+            len: 0,
+            sum: 0.0,
+        }
+    }
+
+    fn push(&mut self, value: f32) {
+        if self.len < self.samples.len() {
+            self.samples[self.next] = value;
+            self.sum += value;
+            self.len += 1;
+        } else {
+            let old_value = self.samples[self.next];
+            self.samples[self.next] = value;
+            self.sum += value - old_value;
+        }
+        self.next = (self.next + 1) % self.samples.len();
+    }
+
+    fn mean(&self) -> f32 {
+        if self.len == 0 {
+            return 0.0;
+        }
+        self.sum / self.len as f32
+    }
 }
 
 impl PerLayerScaleTable {
@@ -89,10 +128,11 @@ impl PerLayerScaleTable {
         overflow_high_threshold: f32,
         overflow_low_threshold: f32,
     ) -> Self {
+        let gradient_window_len = configured_gradient_window_len();
         PerLayerScaleTable {
             density: vec![0.0; num_layers],
             scale: vec![65536.0; num_layers],
-            gradient_variance: vec![0.0; num_layers],
+            gradient_variance: vec![GradientVarianceWindow::new(gradient_window_len); num_layers],
             resident: vec![false; num_layers],
             alpha,
             overflow_high_threshold,
@@ -129,15 +169,12 @@ impl PerLayerScaleTable {
         }
 
         let fraction = n_overflow as f32 / n_total as f32;
-        let new_density =
-            self.alpha * fraction + (1.0 - self.alpha) * self.density[layer_idx];
+        let new_density = self.alpha * fraction + (1.0 - self.alpha) * self.density[layer_idx];
         self.density[layer_idx] = new_density;
 
         if new_density > self.overflow_high_threshold {
             self.scale[layer_idx] = (self.scale[layer_idx] * 0.5).max(1.0);
-        } else if new_density < self.overflow_low_threshold
-            && self.scale[layer_idx] < 65536.0
-        {
+        } else if new_density < self.overflow_low_threshold && self.scale[layer_idx] < 65536.0 {
             self.scale[layer_idx] = (self.scale[layer_idx] * 2.0).min(65536.0);
         }
     }
@@ -162,13 +199,16 @@ impl PerLayerScaleTable {
     /// Module 3 reads this to decide INT4 vs FP16 streaming precision per layer.
     pub fn update_gradient_variance(&mut self, layer_idx: usize, grad_mean_sq: f32) {
         if layer_idx < self.gradient_variance.len() {
-            self.gradient_variance[layer_idx] = grad_mean_sq;
+            self.gradient_variance[layer_idx].push(grad_mean_sq);
         }
     }
 
     /// Gradient variance for `layer_idx` (for Module 3's precision scheduler).
     pub fn gradient_variance(&self, layer_idx: usize) -> f32 {
-        self.gradient_variance.get(layer_idx).copied().unwrap_or(0.0)
+        self.gradient_variance
+            .get(layer_idx)
+            .map(GradientVarianceWindow::mean)
+            .unwrap_or(0.0)
     }
 
     /// Mark or unmark `layer_idx` as hot-set resident.
@@ -196,6 +236,41 @@ impl PerLayerScaleTable {
         for scale_entry in &mut self.scale {
             *scale_entry = 65536.0;
         }
+    }
+}
+
+fn configured_gradient_window_len() -> usize {
+    std::env::var("RAMFLOW_GRADIENT_VARIANCE_WINDOW")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(50)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gradient_variance_uses_windowed_mean_instead_of_raw_last_spike() {
+        let mut table = PerLayerScaleTable::new(2, 0.05);
+
+        for _ in 0..49 {
+            table.update_gradient_variance(1, 1.0);
+        }
+        table.update_gradient_variance(1, 101.0);
+
+        let smoothed = table.gradient_variance(1);
+        assert!(
+            smoothed < 101.0,
+            "windowed gradient variance should smooth the raw last spike"
+        );
+        assert!(
+            (smoothed - 3.0).abs() < 0.001,
+            "expected mean of 49 baseline samples and one spike, got {smoothed}"
+        );
+        assert_eq!(table.gradient_variance(0), 0.0);
     }
 }
 
@@ -303,6 +378,10 @@ impl CoScheduler {
     pub fn register_tensor(&self, tensor_id: u64, priority: u8) {
         self.tensor_registry
             .lock()
+            // SAFETY: this mutex only protects priority metadata. If a prior
+            // holder panicked, recovering the map is preferable to silently
+            // dropping future eviction registrations; no unsafe memory state is
+            // represented by this BTreeMap.
             .unwrap_or_else(|poison| poison.into_inner())
             .insert(tensor_id, priority);
     }
@@ -311,6 +390,10 @@ impl CoScheduler {
     pub fn deregister_tensor(&self, tensor_id: u64) {
         self.tensor_registry
             .lock()
+            // SAFETY: same rationale as register_tensor(): poison only means a
+            // previous metadata update panicked, and continuing with the guarded
+            // BTreeMap preserves scheduler correctness better than leaking stale
+            // tensor priorities.
             .unwrap_or_else(|poison| poison.into_inner())
             .remove(&tensor_id);
     }

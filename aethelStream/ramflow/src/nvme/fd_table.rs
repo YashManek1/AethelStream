@@ -1,7 +1,8 @@
 // src/nvme/fd_table.rs — open file-descriptor table (Sprint 2 Day 2)
 //
 // Tracks open file descriptors for NVMe shard files.
-// Each shard file is opened with: O_RDONLY | O_DIRECT | O_CLOEXEC
+// Each shard file is opened for reads with: O_RDONLY | O_DIRECT | O_CLOEXEC
+// Writes lazily open a companion fd with: O_WRONLY | O_DIRECT | O_CLOEXEC
 //
 // O_DIRECT:  Bypasses the kernel page cache. Reads go straight from the
 //            NVMe controller to the destination buffer (pinned host memory).
@@ -32,6 +33,8 @@ use std::path::Path;
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
+use std::sync::Mutex;
 #[cfg(windows)]
 type OwnedFd = ();
 
@@ -74,6 +77,35 @@ fn open_shard_file(path: &Path) -> Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+#[cfg(target_os = "linux")]
+fn open_shard_write_file(path: &Path) -> Result<OwnedFd> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path_cstr = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        RamFlowError::ConfigError(format!("shard path contains null byte: {:?}", path))
+    })?;
+
+    const O_WRONLY: i32 = 1;
+    const O_DIRECT: i32 = 0x4000;
+    const O_CLOEXEC: i32 = 0o2000000;
+    let flags = O_WRONLY | O_DIRECT | O_CLOEXEC;
+
+    // SAFETY: path_cstr is a valid null-terminated C string. flags are valid.
+    let fd: RawFd = unsafe { libc::open(path_cstr.as_ptr(), flags) };
+
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(RamFlowError::IoUringError(std::io::Error::new(
+            err.kind(),
+            format!("O_DIRECT write open failed for {:?}: {}", path, err),
+        )));
+    }
+
+    // SAFETY: fd is a valid, open file descriptor we just created.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 // Non-Linux fallback: open normally (no O_DIRECT).
 // Used for development on macOS or cross-compilation.
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -89,12 +121,32 @@ fn open_shard_file(path: &Path) -> Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(file.into_raw_fd()) })
 }
 
+#[cfg(all(unix, not(target_os = "linux")))]
+fn open_shard_write_file(path: &Path) -> Result<OwnedFd> {
+    use std::fs::OpenOptions;
+    use std::os::unix::io::IntoRawFd;
+
+    let file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(RamFlowError::IoUringError)?;
+
+    Ok(unsafe { OwnedFd::from_raw_fd(file.into_raw_fd()) })
+}
+
 #[cfg(windows)]
 fn open_shard_file(_path: &Path) -> Result<OwnedFd> {
     // Windows: io_uring is not supported. DirectNvmeEngine is Linux-only.
     // This stub allows the crate to compile on Windows for development.
     Err(RamFlowError::ConfigError(
         "DirectNvmeEngine is not supported on Windows".into(),
+    ))
+}
+
+#[cfg(windows)]
+fn open_shard_write_file(_path: &Path) -> Result<OwnedFd> {
+    Err(RamFlowError::ConfigError(
+        "DirectNvmeEngine writes are not supported on Windows".into(),
     ))
 }
 
@@ -112,6 +164,14 @@ pub struct FdTable {
     #[cfg(unix)]
     fds: HashMap<u32, OwnedFd>,
 
+    /// Shard paths used to lazily open write-capable companion descriptors.
+    #[cfg(unix)]
+    paths: HashMap<u32, std::path::PathBuf>,
+
+    /// Map from shard_id → owned write descriptor, opened on first write.
+    #[cfg(unix)]
+    write_fds: Mutex<HashMap<u32, OwnedFd>>,
+
     /// Number of shards registered.
     count: usize,
 }
@@ -122,6 +182,10 @@ impl FdTable {
         Ok(FdTable {
             #[cfg(unix)]
             fds: HashMap::new(),
+            #[cfg(unix)]
+            paths: HashMap::new(),
+            #[cfg(unix)]
+            write_fds: Mutex::new(HashMap::new()),
             count: 0,
         })
     }
@@ -138,6 +202,7 @@ impl FdTable {
         {
             let fd = open_shard_file(path)?;
             self.fds.insert(_shard_id, fd);
+            self.paths.insert(_shard_id, path.to_path_buf());
         }
         #[cfg(not(unix))]
         open_shard_file(path)?;
@@ -157,6 +222,20 @@ impl FdTable {
         Ok(())
     }
 
+    /// Register an already-open read descriptor for Linux-only unit tests.
+    ///
+    /// This bypasses `O_DIRECT` so tests can exercise SQE/CQE mechanics on
+    /// ordinary temporary files without requiring a raw NVMe filesystem.
+    #[cfg(all(test, unix))]
+    pub(crate) fn register_read_fd_for_test(&mut self, shard_id: u32, raw_fd: RawFd, path: &Path) {
+        // SAFETY: tests pass a freshly opened descriptor and transfer ownership
+        // to FdTable; OwnedFd closes it when the table drops.
+        self.fds
+            .insert(shard_id, unsafe { OwnedFd::from_raw_fd(raw_fd) });
+        self.paths.insert(shard_id, path.to_path_buf());
+        self.count += 1;
+    }
+
     /// Get the raw file descriptor for `shard_id`.
     ///
     /// Returns `None` if the shard is not registered.
@@ -173,6 +252,41 @@ impl FdTable {
     /// Returns `None` on non-Unix platforms where file descriptors are not used.
     pub fn get_raw_fd(&self, _shard_id: u32) -> Option<i32> {
         None
+    }
+
+    /// Get or lazily open the write-capable descriptor for `shard_id`.
+    ///
+    /// The read path keeps its original `O_RDONLY|O_DIRECT` fd. Writes use a
+    /// separate `O_WRONLY|O_DIRECT` companion fd so enabling write-back does not
+    /// alter read scheduling or permissions on the read descriptor.
+    #[cfg(unix)]
+    pub fn get_write_raw_fd(&self, shard_id: u32) -> Result<RawFd> {
+        use std::os::unix::io::AsRawFd;
+
+        let mut write_guard = self
+            .write_fds
+            .lock()
+            .map_err(|_| RamFlowError::ConfigError("write fd table mutex poisoned".into()))?;
+
+        if let Some(fd) = write_guard.get(&shard_id) {
+            return Ok(fd.as_raw_fd());
+        }
+
+        let path = self.paths.get(&shard_id).ok_or_else(|| {
+            RamFlowError::ConfigError(format!("shard_id {shard_id} not registered in FdTable"))
+        })?;
+        let write_fd = open_shard_write_file(path)?;
+        let raw_fd = write_fd.as_raw_fd();
+        write_guard.insert(shard_id, write_fd);
+        Ok(raw_fd)
+    }
+
+    #[cfg(not(unix))]
+    /// Returns an error on non-Unix platforms where file descriptors are not used.
+    pub fn get_write_raw_fd(&self, _shard_id: u32) -> Result<i32> {
+        Err(RamFlowError::ConfigError(
+            "DirectNvmeEngine writes are not supported on this platform".into(),
+        ))
     }
 
     /// Number of registered shards.
@@ -194,7 +308,12 @@ impl FdTable {
         // Draining the HashMap causes OwnedFd::drop to call close() on each fd.
         // If close() fails (e.g., NFS stale handle), we collect the errors.
         // In practice, close() on an O_DIRECT local NVMe fd never fails.
+        self.write_fds
+            .lock()
+            .map_err(|_| RamFlowError::ConfigError("write fd table mutex poisoned".into()))?
+            .clear();
         self.fds.clear();
+        self.paths.clear();
         self.count = 0;
         Ok(())
     }
@@ -209,7 +328,6 @@ impl FdTable {
         Ok(())
     }
 }
-
 
 // Drop implementation: OwnedFd's own Drop calls close(2) for each fd.
 // Nothing additional is needed here — the compiler-generated Drop for
@@ -230,6 +348,7 @@ impl Drop for FdTable {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::io::Write;
 
     #[test]

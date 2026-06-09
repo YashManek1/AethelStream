@@ -73,6 +73,7 @@ const DEFAULT_EMBEDDING_SLOT_BYTES: usize = 32 * 1024 * 1024;
 
 /// Minimum slot size used when deriving sizes from zero_copy_threshold.
 const MINIMUM_SLOT_BYTES: usize = 512;
+const DEFAULT_MAX_PINNED_RAM_FRACTION: f64 = 0.9;
 
 // ---------------------------------------------------------------------------
 // PoolRegistry
@@ -157,6 +158,22 @@ impl PoolRegistry {
         let mlp_slot_count = (profile.mlp_slots_needed as usize).max(1);
         let norm_slot_count = (profile.norm_slots_needed as usize).max(1);
         let embedding_slot_count = (profile.optimizer_slots_needed as usize).max(1);
+
+        let budget_plan = PoolBudgetPlan {
+            large_slot_bytes,
+            norm_slot_bytes,
+            embedding_slot_bytes,
+            attention_slot_count,
+            mlp_slot_count,
+            norm_slot_count,
+            embedding_slot_count,
+        };
+        preflight_profile_memory_budget(
+            profile,
+            &budget_plan,
+            available_ram_bytes(),
+            configured_pool_ram_fraction(),
+        )?;
 
         let attention_ring = Arc::new(RingBuffer::new(large_slot_bytes, attention_slot_count)?);
         let mlp_ring = Arc::new(RingBuffer::new(large_slot_bytes, mlp_slot_count)?);
@@ -408,3 +425,139 @@ fn build_eager_slabs(dict: &TensorLocationDict, threshold: usize) -> Result<Vec<
     Ok(slabs)
 }
 
+struct PoolBudgetPlan {
+    large_slot_bytes: usize,
+    norm_slot_bytes: usize,
+    embedding_slot_bytes: usize,
+    attention_slot_count: usize,
+    mlp_slot_count: usize,
+    norm_slot_count: usize,
+    embedding_slot_count: usize,
+}
+
+fn preflight_profile_memory_budget(
+    profile: &crate::phase::classifier::PhaseMemoryProfile,
+    plan: &PoolBudgetPlan,
+    available_bytes: Option<u64>,
+    max_fraction: f64,
+) -> Result<()> {
+    let Some(available_bytes) = available_bytes else {
+        return Ok(());
+    };
+
+    let pool_bytes = checked_sum(&[
+        checked_mul(plan.large_slot_bytes, plan.attention_slot_count)?,
+        checked_mul(plan.large_slot_bytes, plan.mlp_slot_count)?,
+        checked_mul(plan.norm_slot_bytes, plan.norm_slot_count)?,
+        checked_mul(plan.embedding_slot_bytes, plan.embedding_slot_count)?,
+    ])?;
+    let checkpoint_budget = profile.expected_peak_bytes as u128;
+    let optimizer_budget = checked_mul(plan.embedding_slot_bytes, plan.embedding_slot_count)?;
+    let estimated_peak = checked_sum(&[pool_bytes, checkpoint_budget, optimizer_budget])?;
+    let allowed_bytes = (available_bytes as f64 * max_fraction.clamp(0.0, 1.0)) as u128;
+
+    if estimated_peak > allowed_bytes {
+        return Err(RamFlowError::ConfigError(format!(
+            "pool pre-flight budget estimate {estimated_peak} bytes exceeds {:.1}% of available RAM ({available_bytes} bytes)",
+            max_fraction.clamp(0.0, 1.0) * 100.0
+        )));
+    }
+
+    Ok(())
+}
+
+fn checked_mul(bytes: usize, count: usize) -> Result<u128> {
+    (bytes as u128)
+        .checked_mul(count as u128)
+        .ok_or_else(|| RamFlowError::ConfigError("pool pre-flight budget overflow".into()))
+}
+
+fn checked_sum(values: &[u128]) -> Result<u128> {
+    values.iter().try_fold(0_u128, |accumulator, value| {
+        accumulator
+            .checked_add(*value)
+            .ok_or_else(|| RamFlowError::ConfigError("pool pre-flight budget overflow".into()))
+    })
+}
+
+fn configured_pool_ram_fraction() -> f64 {
+    std::env::var("RAMFLOW_POOL_RAM_FRACTION")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| *value > 0.0)
+        .unwrap_or(DEFAULT_MAX_PINNED_RAM_FRACTION)
+}
+
+fn available_ram_bytes() -> Option<u64> {
+    if let Some(override_bytes) = std::env::var("RAMFLOW_MEM_AVAILABLE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Some(override_bytes);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        read_linux_mem_available_bytes()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_mem_available_bytes() -> Option<u64> {
+    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in contents.lines() {
+        let Some(rest) = line.strip_prefix("MemAvailable:") else {
+            continue;
+        };
+        let kib = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+        return kib.checked_mul(1024);
+    }
+    None
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::phase::{PhaseMemoryProfile, TrainingPhase};
+
+    #[test]
+    fn absurd_profile_is_rejected_by_preflight_budget() {
+        let profile = PhaseMemoryProfile {
+            phase: TrainingPhase::Forward {
+                layers_in_flight: 1,
+            },
+            expected_peak_bytes: 8 * 1024 * 1024,
+            attention_slots_needed: 1024,
+            mlp_slots_needed: 1024,
+            norm_slots_needed: 1024,
+            optimizer_slots_needed: 1024,
+        };
+
+        let budget_plan = PoolBudgetPlan {
+            large_slot_bytes: 1024 * 1024,
+            norm_slot_bytes: 1024 * 1024,
+            embedding_slot_bytes: 1024 * 1024,
+            attention_slot_count: profile.attention_slots_needed as usize,
+            mlp_slot_count: profile.mlp_slots_needed as usize,
+            norm_slot_count: profile.norm_slots_needed as usize,
+            embedding_slot_count: profile.optimizer_slots_needed as usize,
+        };
+        let result = preflight_profile_memory_budget(
+            &profile,
+            &budget_plan,
+            Some(64 * 1024 * 1024),
+            DEFAULT_MAX_PINNED_RAM_FRACTION,
+        );
+
+        assert!(
+            matches!(result, Err(RamFlowError::ConfigError(ref message)) if message.contains("pre-flight budget")),
+            "absurd pool profile should fail before allocation, got {result:?}"
+        );
+    }
+}

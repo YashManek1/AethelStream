@@ -80,3 +80,104 @@ fn test_pressure_control_stops_submissions_before_overflow() {
         "submission should be blocked when outstanding+claimed exceeds threshold"
     );
 }
+
+#[test]
+fn test_t3_capacity_plus_one_simultaneous_claim_has_no_double_issue_or_deadlock() {
+    use ramflow::phase::{PhaseMemoryProfile, TrainingPhase};
+    use ramflow::pool::{LayerKind, PoolRegistry, TensorLocationDict};
+    use std::collections::HashSet;
+    use std::sync::{mpsc, Arc, Barrier};
+    use std::time::Duration;
+
+    const CAPACITY: usize = 4;
+    let profile = PhaseMemoryProfile {
+        phase: TrainingPhase::Forward {
+            layers_in_flight: CAPACITY as u32,
+        },
+        expected_peak_bytes: 0,
+        attention_slots_needed: CAPACITY as u32,
+        mlp_slots_needed: 1,
+        norm_slots_needed: 1,
+        optimizer_slots_needed: 1,
+    };
+    let registry = Arc::new(
+        PoolRegistry::new(&profile, &TensorLocationDict::empty(), 1024)
+            .expect("registry construction failed"),
+    );
+    let barrier = Arc::new(Barrier::new(CAPACITY + 1));
+    let (sender, receiver) = mpsc::channel();
+
+    for thread_index in 0..(CAPACITY + 1) {
+        let thread_registry = Arc::clone(&registry);
+        let thread_barrier = Arc::clone(&barrier);
+        let thread_sender = sender.clone();
+        std::thread::spawn(move || {
+            thread_barrier.wait();
+            let slot = thread_registry
+                .claim(LayerKind::Attention)
+                .expect("claim failed");
+            let slot_index = slot.slot_index();
+            let buffer_ptr = slot.buffer().as_ptr() as usize;
+            thread_sender
+                .send((thread_index, slot_index, buffer_ptr, slot))
+                .expect("receiver dropped");
+        });
+    }
+    drop(sender);
+
+    let mut results = Vec::new();
+    for _ in 0..(CAPACITY + 1) {
+        results.push(
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("claim race deadlocked"),
+        );
+    }
+
+    let pooled: Vec<_> = results
+        .iter()
+        .filter(|(_thread_index, slot_index, _buffer_ptr, _slot)| *slot_index != usize::MAX)
+        .collect();
+    let slow_path: Vec<_> = results
+        .iter()
+        .filter(|(_thread_index, slot_index, _buffer_ptr, _slot)| *slot_index == usize::MAX)
+        .collect();
+
+    assert_eq!(
+        pooled.len(),
+        CAPACITY,
+        "exactly the fixed ring capacity should receive pooled slots"
+    );
+    assert_eq!(
+        slow_path.len(),
+        1,
+        "capacity+1 claim should route exactly one claimant through slow path overflow"
+    );
+
+    let pooled_slot_indices: HashSet<usize> = pooled
+        .iter()
+        .map(|(_thread_index, slot_index, _buffer_ptr, _slot)| *slot_index)
+        .collect();
+    assert_eq!(
+        pooled_slot_indices.len(),
+        CAPACITY,
+        "pooled slot index double-issued during simultaneous claim"
+    );
+
+    let pooled_buffer_ptrs: HashSet<usize> = pooled
+        .iter()
+        .map(|(_thread_index, _slot_index, buffer_ptr, _slot)| *buffer_ptr)
+        .collect();
+    assert_eq!(
+        pooled_buffer_ptrs.len(),
+        CAPACITY,
+        "pooled buffer pointer double-issued during simultaneous claim"
+    );
+
+    drop(results);
+    assert_eq!(
+        registry.claimed_slots_for(LayerKind::Attention),
+        0,
+        "all pooled slots should return after guards drop"
+    );
+}

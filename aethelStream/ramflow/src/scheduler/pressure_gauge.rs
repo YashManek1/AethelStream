@@ -77,10 +77,7 @@ impl GaugeInner {
     ///
     /// The Mutex is never held during invocation: a callback that calls
     /// register_high/low_pressure will acquire the lock without contention.
-    pub(crate) fn fire_callbacks(
-        callbacks: &CallbackList,
-        pressure: f32,
-    ) {
+    pub(crate) fn fire_callbacks(callbacks: &CallbackList, pressure: f32) {
         let snapshot: Vec<PressureCallback> = callbacks
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())

@@ -142,6 +142,140 @@ fn test_cqe_pipeline_submit_then_token() {
     let _ = std::fs::remove_file(path);
 }
 
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore)]
+fn test_io_uring_write_async_round_trip_byte_identical() {
+    #[cfg(not(target_os = "linux"))]
+    return;
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::FileExt;
+
+        const FILE_SIZE: usize = 4 * 1024 * 1024;
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/ramflow_io_uring_write_it_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock error")
+                .as_nanos()
+        ));
+
+        {
+            let file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .expect("failed to create temp file");
+            file.set_len(FILE_SIZE as u64)
+                .expect("failed to size temp file");
+            file.sync_all().expect("failed to sync temp file");
+        }
+
+        let expected = pseudo_random_bytes(FILE_SIZE, 0x5155_EE7A_5A17_E123);
+        let mut src = PinnedBuffer::alloc(FILE_SIZE).expect("PinnedBuffer::alloc failed");
+        src.as_mut_slice().copy_from_slice(&expected);
+
+        let mut engine =
+            DirectNvmeEngine::open_with_paths(&[path.as_path()]).expect("engine open failed");
+        engine
+            .start_cqe_poller(0)
+            .expect("failed to start cqe poller");
+
+        let token = 0x5752_4954_455F_0001;
+        engine
+            .write_async(0, 0, FILE_SIZE as u64, &src, token)
+            .expect("write_async submit failed");
+
+        let cqe = engine
+            .completion_rx()
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("timeout waiting for write cqe");
+        assert_eq!(cqe.token, token, "token mismatch");
+        assert_eq!(
+            cqe.result, FILE_SIZE as i32,
+            "write completed with unexpected result {}",
+            cqe.result
+        );
+
+        let file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("open temp file for pread failed");
+        let mut actual = vec![0u8; FILE_SIZE];
+        file.read_exact_at(&mut actual, 0)
+            .expect("plain pread failed");
+        assert_eq!(actual, expected, "write_async payload mismatch");
+
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore)]
+fn test_write_async_rejects_misaligned_inputs_without_panic() {
+    #[cfg(not(target_os = "linux"))]
+    return;
+
+    #[cfg(target_os = "linux")]
+    {
+        use ramflow::nvme::prefetch::validate_direct_io_alignment;
+        use ramflow::RamFlowError;
+
+        let engine = DirectNvmeEngine::open_with_paths(&[]).expect("engine open failed");
+        let src = PinnedBuffer::alloc(512).expect("PinnedBuffer::alloc failed");
+
+        let misaligned_offset = engine.write_async(0, 1, 512, &src, 0xBAD0);
+        assert!(
+            matches!(misaligned_offset, Err(RamFlowError::IoUringError(ref error)) if error.kind() == std::io::ErrorKind::InvalidInput),
+            "expected InvalidInput for misaligned offset, got {misaligned_offset:?}"
+        );
+
+        let misaligned_length = engine.write_async(0, 0, 511, &src, 0xBAD1);
+        assert!(
+            matches!(misaligned_length, Err(RamFlowError::IoUringError(ref error)) if error.kind() == std::io::ErrorKind::InvalidInput),
+            "expected InvalidInput for misaligned length, got {misaligned_length:?}"
+        );
+
+        let misaligned_ptr = src.as_ptr().wrapping_add(1);
+        let misaligned_buffer = validate_direct_io_alignment(0, 512, misaligned_ptr);
+        assert!(
+            matches!(misaligned_buffer, Err(RamFlowError::IoUringError(ref error)) if error.kind() == std::io::ErrorKind::InvalidInput),
+            "expected InvalidInput for misaligned buffer, got {misaligned_buffer:?}"
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(not(target_os = "linux"), ignore)]
+fn test_write_async_pause_returns_without_submission() {
+    #[cfg(not(target_os = "linux"))]
+    return;
+
+    #[cfg(target_os = "linux")]
+    {
+        use ramflow::RamFlowError;
+
+        let engine = DirectNvmeEngine::open_with_paths(&[]).expect("engine open failed");
+        let src = PinnedBuffer::alloc(512).expect("PinnedBuffer::alloc failed");
+        engine.set_pause(true);
+
+        let result = engine.write_async(0, 0, 512, &src, 0x5041_5553_45);
+        assert!(
+            matches!(result, Err(RamFlowError::PressurePause(0))),
+            "expected PressurePause before submission, got {result:?}"
+        );
+        assert_eq!(
+            engine.outstanding_reads(),
+            0,
+            "paused write must not increment outstanding I/O"
+        );
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn test_io_uring_linux_only() {

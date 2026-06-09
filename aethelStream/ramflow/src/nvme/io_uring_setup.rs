@@ -23,9 +23,9 @@
 //   IORING_SETUP_SQ_AFF). We probe availability at runtime and fall back
 //   to the standard mode gracefully.
 
-use crate::Result;
 #[cfg(any(target_os = "linux", doc))]
 use crate::RamFlowError;
+use crate::Result;
 #[cfg(all(target_os = "linux", feature = "io-uring-use-split"))]
 use std::sync::Mutex;
 
@@ -73,14 +73,17 @@ impl Default for IoUringParams {
 /// On non-Linux, it is a no-op stub so the crate compiles cross-platform.
 pub struct IoUringInstance {
     #[cfg(all(target_os = "linux", not(feature = "io-uring-use-split")))]
-    inner: IoUring,
+    inner: Option<IoUring>,
 
     #[cfg(all(target_os = "linux", feature = "io-uring-use-split"))]
-    inner: Mutex<IoUring>,
+    inner: Mutex<Option<IoUring>>,
 
     /// Whether SQPOLL was successfully enabled at construction.
     /// Callers can log this for diagnostics.
     pub sqpoll_active: bool,
+
+    /// Whether blocking pread/pwrite fallback is active.
+    pub libaio_fallback_active: bool,
 }
 
 impl IoUringInstance {
@@ -102,10 +105,11 @@ impl IoUringInstance {
                 if let Ok(ring) = sqpoll_result {
                     return Ok(IoUringInstance {
                         #[cfg(not(feature = "io-uring-use-split"))]
-                        inner: ring,
+                        inner: Some(ring),
                         #[cfg(feature = "io-uring-use-split")]
-                        inner: Mutex::new(ring),
+                        inner: Mutex::new(Some(ring)),
                         sqpoll_active: true,
+                        libaio_fallback_active: false,
                     });
                 }
                 // SQPOLL failed (insufficient privilege, old kernel, etc.)
@@ -117,16 +121,39 @@ impl IoUringInstance {
             }
 
             // --- Standard mode ---
-            let ring = IoUring::builder()
-                .build(params.sq_entries)
-                .map_err(|e| RamFlowError::IoUringError(e))?;
+            let standard_result = IoUring::builder().build(params.sq_entries);
+            let ring = match standard_result {
+                Ok(ring) => ring,
+                Err(error) => {
+                    #[cfg(feature = "libaio-fallback")]
+                    {
+                        eprintln!(
+                            "ramflow: io_uring setup failed ({error}); using blocking libaio-fallback path for correctness."
+                        );
+                        return Ok(IoUringInstance {
+                            #[cfg(not(feature = "io-uring-use-split"))]
+                            inner: None,
+                            #[cfg(feature = "io-uring-use-split")]
+                            inner: Mutex::new(None),
+                            sqpoll_active: false,
+                            libaio_fallback_active: true,
+                        });
+                    }
+
+                    #[cfg(not(feature = "libaio-fallback"))]
+                    {
+                        return Err(RamFlowError::IoUringError(error));
+                    }
+                }
+            };
 
             Ok(IoUringInstance {
                 #[cfg(not(feature = "io-uring-use-split"))]
-                inner: ring,
+                inner: Some(ring),
                 #[cfg(feature = "io-uring-use-split")]
-                inner: Mutex::new(ring),
+                inner: Mutex::new(Some(ring)),
                 sqpoll_active: false,
+                libaio_fallback_active: false,
             })
         }
 
@@ -136,7 +163,25 @@ impl IoUringInstance {
             // DirectNvmeEngine uses cfg! guards to route to sync fallbacks.
             Ok(IoUringInstance {
                 sqpoll_active: false,
+                libaio_fallback_active: false,
             })
+        }
+    }
+
+    /// True when the feature-gated blocking fallback is serving submissions.
+    pub fn is_libaio_fallback_active(&self) -> bool {
+        self.libaio_fallback_active
+    }
+
+    #[cfg(all(test, target_os = "linux", feature = "libaio-fallback"))]
+    pub(crate) fn libaio_fallback_for_test() -> Self {
+        IoUringInstance {
+            #[cfg(not(feature = "io-uring-use-split"))]
+            inner: None,
+            #[cfg(feature = "io-uring-use-split")]
+            inner: Mutex::new(None),
+            sqpoll_active: false,
+            libaio_fallback_active: true,
         }
     }
 
@@ -155,11 +200,19 @@ impl IoUringInstance {
                 .inner
                 .lock()
                 .map_err(|_| RamFlowError::ConfigError("io_uring mutex poisoned".into()))?;
-            return guard.submit().map_err(RamFlowError::IoUringError);
+            let Some(ring) = guard.as_ref() else {
+                return Ok(0);
+            };
+            return ring.submit().map_err(RamFlowError::IoUringError);
         }
 
         #[cfg(not(feature = "io-uring-use-split"))]
-        self.inner.submit().map_err(RamFlowError::IoUringError)
+        {
+            let Some(ring) = self.inner.as_ref() else {
+                return Ok(0);
+            };
+            ring.submit().map_err(RamFlowError::IoUringError)
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -186,7 +239,12 @@ impl IoUringInstance {
                 .inner
                 .lock()
                 .map_err(|_| RamFlowError::ConfigError("io_uring mutex poisoned".into()))?;
-            let (_submitter, mut sq, _cq) = guard.split();
+            let Some(ring) = guard.as_mut() else {
+                return Err(RamFlowError::ConfigError(
+                    "io_uring unavailable; libaio-fallback is active".into(),
+                ));
+            };
+            let (_submitter, mut sq, _cq) = ring.split();
             let out = f(&mut sq)?;
             sq.sync();
             return Ok(out);
@@ -195,7 +253,12 @@ impl IoUringInstance {
         #[cfg(not(feature = "io-uring-use-split"))]
         {
             // SAFETY: caller serializes access through engine-level invariants.
-            let mut sq = unsafe { self.inner.submission_shared() };
+            let Some(ring) = self.inner.as_ref() else {
+                return Err(RamFlowError::ConfigError(
+                    "io_uring unavailable; libaio-fallback is active".into(),
+                ));
+            };
+            let mut sq = unsafe { ring.submission_shared() };
             f(&mut sq)
         }
     }
@@ -215,14 +278,20 @@ impl IoUringInstance {
                 .inner
                 .lock()
                 .map_err(|_| RamFlowError::ConfigError("io_uring mutex poisoned".into()))?;
-            let (_submitter, _sq, mut cq) = guard.split();
+            let Some(ring) = guard.as_mut() else {
+                return Ok(());
+            };
+            let (_submitter, _sq, mut cq) = ring.split();
             return f(&mut cq);
         }
 
         #[cfg(not(feature = "io-uring-use-split"))]
         {
+            let Some(ring) = self.inner.as_ref() else {
+                return Ok(());
+            };
             // SAFETY: caller serializes access through engine-level invariants.
-            let mut cq = unsafe { self.inner.completion_shared() };
+            let mut cq = unsafe { ring.completion_shared() };
             f(&mut cq)
         }
     }
@@ -243,7 +312,10 @@ impl IoUringInstance {
                 .inner
                 .lock()
                 .map_err(|_| RamFlowError::ConfigError("io_uring mutex poisoned".into()))?;
-            return guard
+            let Some(ring) = guard.as_ref() else {
+                return Ok(());
+            };
+            return ring
                 .submitter()
                 .wait_with_timeout(&ts)
                 .map_err(RamFlowError::IoUringError);
@@ -251,8 +323,10 @@ impl IoUringInstance {
 
         #[cfg(not(feature = "io-uring-use-split"))]
         {
-            self.inner
-                .submitter()
+            let Some(ring) = self.inner.as_ref() else {
+                return Ok(());
+            };
+            ring.submitter()
                 .wait_with_timeout(&ts)
                 .map_err(RamFlowError::IoUringError)
         }

@@ -111,6 +111,48 @@ bool ramflow_check_overflow_fp16(
     return h_result;
 }
 
+int ramflow_launch_overflow_check_fp16_async(
+    const __half* grad_device,
+    int           n,
+    cudaStream_t  stream,
+    bool*         host_result
+) {
+    if (grad_device == nullptr || host_result == nullptr || n < 0) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+
+    bool* d_flag = nullptr;
+    cudaError_t status = cudaMallocAsync(&d_flag, sizeof(bool), stream);
+    if (status != cudaSuccess) {
+        return static_cast<int>(status);
+    }
+
+    status = cudaMemsetAsync(d_flag, 0, sizeof(bool), stream);
+    if (status != cudaSuccess) {
+        cudaFreeAsync(d_flag, stream);
+        return static_cast<int>(status);
+    }
+
+    const int block_dim = 256;
+    const int grid_dim  = (n + block_dim - 1) / block_dim;
+
+    fused_overflow_check<<<grid_dim, block_dim, 0, stream>>>(grad_device, n, d_flag);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        cudaFreeAsync(d_flag, stream);
+        return static_cast<int>(status);
+    }
+
+    status = cudaMemcpyAsync(host_result, d_flag, sizeof(bool), cudaMemcpyDeviceToHost, stream);
+    if (status != cudaSuccess) {
+        cudaFreeAsync(d_flag, stream);
+        return static_cast<int>(status);
+    }
+
+    status = cudaFreeAsync(d_flag, stream);
+    return static_cast<int>(status);
+}
+
 // ---------------------------------------------------------------------------
 // Sprint 0 stub symbol — keeps the archive non-empty if this TU is linked
 // standalone during early build phases. Remove in Sprint 4 cleanup.

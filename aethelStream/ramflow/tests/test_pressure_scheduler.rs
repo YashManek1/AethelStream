@@ -103,7 +103,10 @@ fn test_8_high_pressure_triggers_coscheduler_pause_and_window_shrink() {
         low_fired,
         "low-pressure callback must fire within {max_steps} steps after pool is empty"
     );
-    assert!(!co.is_paused(), "pause signal must be cleared after low-pressure event");
+    assert!(
+        !co.is_paused(),
+        "pause signal must be cleared after low-pressure event"
+    );
     assert!(
         co.prefetch_window() > window_after_high,
         "prefetch window must grow after low-pressure event: before={window_after_high}, after={}",

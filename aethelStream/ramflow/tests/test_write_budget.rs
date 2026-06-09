@@ -20,8 +20,8 @@
 
 #[cfg(feature = "ssd-wear")]
 use ramflow::nvme::write_budget::{
-    compress_delta, decompress_and_apply_delta, MockSmartSource, WriteBudgetManager,
-    WriteStrategy, SMART_UNIT_BYTES,
+    compress_delta, decompress_and_apply_delta, MockSmartSource, WriteBudgetManager, WriteStrategy,
+    SMART_UNIT_BYTES,
 };
 #[cfg(feature = "ssd-wear")]
 use std::path::PathBuf;
@@ -39,11 +39,8 @@ fn test_10_wear_tracking_consumes_budget_and_auto_switches_strategy() {
     let source = Box::new(MockSmartSource::new(1_000));
     // Budget: 100 SMART units = 100 × 512 000 = 51 200 000 bytes.
     let budget_bytes: u64 = 100 * SMART_UNIT_BYTES;
-    let manager = WriteBudgetManager::new_with_source(
-        PathBuf::from("/dev/nvme0"),
-        budget_bytes,
-        source,
-    );
+    let manager =
+        WriteBudgetManager::new_with_source(PathBuf::from("/dev/nvme0"), budget_bytes, source);
 
     assert_eq!(
         manager.units_at_start(),
@@ -62,7 +59,9 @@ fn test_10_wear_tracking_consumes_budget_and_auto_switches_strategy() {
     );
 
     // ── Consume 10 units (10% consumed, 90% remaining) → still Full ──────────
-    manager.consume(10 * SMART_UNIT_BYTES).expect("consume 10 units");
+    manager
+        .consume(10 * SMART_UNIT_BYTES)
+        .expect("consume 10 units");
     assert_eq!(manager.remaining(), 90, "remaining after 10 units");
     assert_eq!(
         manager.strategy(),
@@ -71,7 +70,9 @@ fn test_10_wear_tracking_consumes_budget_and_auto_switches_strategy() {
     );
 
     // ── Consume 41 more → 51 total → 49 remaining (<50%) → DeltaCompress ─────
-    manager.consume(41 * SMART_UNIT_BYTES).expect("consume 41 units");
+    manager
+        .consume(41 * SMART_UNIT_BYTES)
+        .expect("consume 41 units");
     assert_eq!(manager.remaining(), 49, "remaining after 51 units consumed");
     assert_eq!(
         manager.strategy(),
@@ -80,7 +81,9 @@ fn test_10_wear_tracking_consumes_budget_and_auto_switches_strategy() {
     );
 
     // ── Consume 40 more → 91 total → 9 remaining (<10%) → Deferred{4} ───────
-    manager.consume(40 * SMART_UNIT_BYTES).expect("consume 40 units");
+    manager
+        .consume(40 * SMART_UNIT_BYTES)
+        .expect("consume 40 units");
     assert_eq!(manager.remaining(), 9, "remaining after 91 units consumed");
     assert_eq!(
         manager.strategy(),
@@ -137,10 +140,8 @@ fn test_11_delta_round_trip_reconstructs_fp16_weights_exactly() {
     // Updated: apply a small cyclic delta (-1, 0, +1) to each LE i16 value.
     let updated: Vec<u8> = (0..N_ELEMENTS)
         .flat_map(|element_idx| {
-            let orig_val = i16::from_le_bytes([
-                original[element_idx * 2],
-                original[element_idx * 2 + 1],
-            ]);
+            let orig_val =
+                i16::from_le_bytes([original[element_idx * 2], original[element_idx * 2 + 1]]);
             let delta: i16 = (element_idx % 3) as i16 - 1; // -1, 0, +1 cycling
             orig_val.wrapping_add(delta).to_le_bytes()
         })
@@ -155,9 +156,8 @@ fn test_11_delta_round_trip_reconstructs_fp16_weights_exactly() {
     );
 
     // Decompress and apply to recover the updated tensor.
-    let reconstructed =
-        decompress_and_apply_delta(LAYER_IDX, &original, &tmp_dir)
-            .expect("decompress_and_apply_delta must succeed");
+    let reconstructed = decompress_and_apply_delta(LAYER_IDX, &original, &tmp_dir)
+        .expect("decompress_and_apply_delta must succeed");
 
     assert_eq!(
         reconstructed.len(),
@@ -167,8 +167,7 @@ fn test_11_delta_round_trip_reconstructs_fp16_weights_exactly() {
         updated.len()
     );
     assert_eq!(
-        reconstructed,
-        updated,
+        reconstructed, updated,
         "delta round-trip must be bit-exact: every byte must match"
     );
 
@@ -195,8 +194,7 @@ fn test_12_int8_checkpoint_round_trip_deviation_within_spec() {
     // Each channel sees a full period, calibrating per-channel scale accurately.
     let values: Vec<f32> = (0..N_TOTAL)
         .map(|index| {
-            let phase = (index as f32 * 2.0 * std::f32::consts::PI)
-                / (ELEMS_PER_CHANNEL as f32);
+            let phase = (index as f32 * 2.0 * std::f32::consts::PI) / (ELEMS_PER_CHANNEL as f32);
             phase.sin()
         })
         .collect();
@@ -219,9 +217,7 @@ fn test_12_int8_checkpoint_round_trip_deviation_within_spec() {
         .enumerate()
         .map(|(index, value)| {
             let channel = index / ELEMS_PER_CHANNEL;
-            (value / scales[channel])
-                .round()
-                .clamp(-128.0, 127.0) as i8
+            (value / scales[channel]).round().clamp(-128.0, 127.0) as i8
         })
         .collect();
 
