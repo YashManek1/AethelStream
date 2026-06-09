@@ -23,8 +23,9 @@
 //   IORING_SETUP_SQ_AFF). We probe availability at runtime and fall back
 //   to the standard mode gracefully.
 
-use crate::{RamFlowError, Result};
-use std::io;
+use crate::Result;
+#[cfg(any(target_os = "linux", doc))]
+use crate::RamFlowError;
 #[cfg(all(target_os = "linux", feature = "io-uring-use-split"))]
 use std::sync::Mutex;
 
@@ -88,6 +89,7 @@ impl IoUringInstance {
     /// Attempts SQPOLL if `params.try_sqpoll` is true and falls back to
     /// standard mode if the kernel rejects the flag (e.g., older kernel,
     /// insufficient privileges).
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     pub fn setup(params: IoUringParams) -> Result<Self> {
         #[cfg(target_os = "linux")]
         {
@@ -161,6 +163,10 @@ impl IoUringInstance {
     }
 
     #[cfg(not(target_os = "linux"))]
+    /// Stub: returns `Ok(0)` on non-Linux platforms where io_uring is unavailable.
+    ///
+    /// # Errors
+    /// Never errors on non-Linux.
     pub fn submit(&self) -> Result<usize> {
         Ok(0)
     }
@@ -253,6 +259,10 @@ impl IoUringInstance {
     }
 
     #[cfg(not(target_os = "linux"))]
+    /// Stub: returns `Ok(())` immediately on non-Linux platforms.
+    ///
+    /// # Errors
+    /// Never errors on non-Linux.
     pub fn wait_for_cqe_timeout(&self, _timeout_ms: u64) -> Result<()> {
         Ok(())
     }

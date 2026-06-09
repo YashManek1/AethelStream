@@ -1,109 +1,103 @@
 // src/cuda_bridge/zero_copy.rs — hybrid zero-copy router (Algorithm 3)
-//
-// Sprint 0: all types declared, all logic unimplemented!.
-//
-// Decision tree at runtime (threshold tuned by WarmupProfiler):
-//
-//   tensor.size_bytes < ZERO_COPY_THRESHOLD
-//     → ZeroCopy: cudaHostGetDevicePointer → GPU reads pinned CPU mem via UVA
-//       (requires buf registered with cudaHostRegisterMapped flag)
-//   tensor.size_bytes ≥ ZERO_COPY_THRESHOLD
-//     → DmaCopy:  cudaMallocAsync + cudaMemcpyAsync → full PCIe DMA to VRAM
-//       (requires buf registered with cudaHostRegisterDefault flag)
-//
-// The crossover threshold defaults to 4 MiB on PCIe Gen4 x16, but the
-// WarmupProfiler measures it on the actual machine and stores it in
-// hardware_profile.json.
 
+use std::os::raw::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::allocator::PinnedBuffer;
+use crate::cuda_bridge::bindings::{
+    cuda_host_get_device_pointer, cuda_malloc_async, cuda_memcpy_async_host_to_device,
+};
 use crate::cuda_bridge::stream::CudaStream;
+use crate::Result;
 
-// ---------------------------------------------------------------------------
-// Transfer strategy types
-// ---------------------------------------------------------------------------
-
-/// Opaque GPU-side device pointer returned by cudaHostGetDevicePointer.
+/// Opaque GPU-side device pointer returned by CUDA.
 ///
-/// Only valid while the underlying `PinnedBuffer` is alive and registered
-/// with `cudaHostRegisterMapped`.
-#[derive(Debug)]
+/// For zero-copy routes this is the UVA pointer returned by
+/// `cudaHostGetDevicePointer`. For mock-cuda it aliases the host pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DevicePointer {
-    _raw: *mut u8,
+    raw: *mut u8,
 }
 
-// Safety: DevicePointer is a plain address that can be sent across threads.
-// The underlying memory it points to is either pinned host memory (coherent
-// via UVA) or VRAM — both are multi-GPU-accessible.
+// Safety: DevicePointer is a plain address. The caller must keep the backing
+// allocation alive and synchronize external access.
 unsafe impl Send for DevicePointer {}
 unsafe impl Sync for DevicePointer {}
+
+impl DevicePointer {
+    /// Construct from a raw pointer.
+    ///
+    /// # Safety
+    /// `raw` must remain valid for the intended GPU operation lifetime.
+    pub unsafe fn from_raw(raw: *mut u8) -> Self {
+        DevicePointer { raw }
+    }
+
+    /// Return the raw pointer value for CUDA kernel launches.
+    pub fn as_ptr(&self) -> *mut u8 {
+        self.raw
+    }
+}
 
 /// The two transfer strategies the router selects between.
 #[derive(Debug)]
 pub enum TransferStrategy {
     /// GPU reads pinned CPU memory directly via CUDA UVA.
-    ///
-    /// No PCIe copy is issued.  Latency is lower for sub-threshold tensors.
-    /// The `device_ptr` is valid for the lifetime of the source `PinnedBuffer`.
-    ZeroCopy { device_ptr: DevicePointer },
+    ZeroCopy {
+        /// Device-visible pointer to the mapped host allocation.
+        device_ptr: DevicePointer,
+    },
 
     /// Full asynchronous PCIe DMA copy to a VRAM staging buffer.
-    ///
-    /// Preferred for large tensors (≥ threshold bytes) where sustained PCIe
-    /// bandwidth outweighs the latency benefit of UVA reads.
     DmaCopy {
-        /// The CUDA stream on which the `cudaMemcpyAsync` was issued.
+        /// CUDA stream associated with the asynchronous copy.
         stream: CudaStream,
     },
 }
 
-// ---------------------------------------------------------------------------
-// Zero-copy threshold (globally configurable, set by WarmupProfiler)
-// ---------------------------------------------------------------------------
-
 /// Default threshold: 4 MiB (calibrated for PCIe Gen4 x16).
-/// Overwritten at runtime by `ZeroCopyRouter::set_threshold`.
 static ZERO_COPY_THRESHOLD: AtomicUsize = AtomicUsize::new(4 * 1024 * 1024);
 
-// ---------------------------------------------------------------------------
-// ZeroCopyRouter — the routing engine itself
-// ---------------------------------------------------------------------------
-
 /// Selects [`TransferStrategy`] for each tensor at runtime.
-///
-/// Instantiated once by [`PoolRegistry`].  Holds no mutable state — all
-/// configuration is stored in atomics so callbacks can update the threshold
-/// without taking a lock.
-///
-/// # Sprint 0 contract
-/// Compiles; `route` and `set_threshold` are `unimplemented!`.
-pub struct ZeroCopyRouter {
-    _opaque: (),
-}
+pub struct ZeroCopyRouter;
 
 impl ZeroCopyRouter {
-    /// Construct a router.  The threshold is initially `ZERO_COPY_THRESHOLD`.
+    /// Construct a router. The threshold is held globally.
     pub fn new() -> Self {
-        unimplemented!("ZeroCopyRouter::new — Sprint 0 stub")
+        ZeroCopyRouter
     }
 
-    /// Route `buf` to the appropriate transfer strategy.
+    /// Route `buf` to zero-copy or DMA.
     ///
-    /// `buf.is_mapped` must be `true` for `ZeroCopy` to be returned;
-    /// if it is `false` this always falls back to `DmaCopy`.
-    #[allow(unused_variables)]
-    pub fn route(
-        &self,
-        buf: &crate::allocator::PinnedBuffer,
-        stream: &CudaStream,
-    ) -> crate::Result<TransferStrategy> {
-        unimplemented!("ZeroCopyRouter::route — Sprint 0 stub")
+    /// Zero-copy is selected only when `buf.len() < threshold` and the buffer
+    /// was registered with `cudaHostRegisterMapped`. Otherwise this performs a
+    /// host-to-device async copy and returns `DmaCopy`.
+    ///
+    /// # Errors
+    /// Returns [`crate::RamFlowError::CudaError`] when CUDA pointer lookup,
+    /// allocation, or copy submission fails.
+    pub fn route(&self, buf: &PinnedBuffer, stream: &CudaStream) -> Result<TransferStrategy> {
+        if buf.len() < Self::threshold() && buf.is_mapped() {
+            let device_ptr = device_pointer_for_mapped_buffer(buf)?;
+            return Ok(TransferStrategy::ZeroCopy { device_ptr });
+        }
+
+        let device_ptr = unsafe { cuda_malloc_async(buf.len(), stream.as_raw())? };
+        unsafe {
+            cuda_memcpy_async_host_to_device(
+                device_ptr,
+                buf.as_ptr() as *const c_void,
+                buf.len(),
+                stream.as_raw(),
+            )?;
+        }
+
+        Ok(TransferStrategy::DmaCopy {
+            stream: CudaStream::new()?,
+        })
     }
 
-    /// Update the crossover threshold (bytes).
-    ///
-    /// Called by the warm-up profiler after measuring the actual crossover
-    /// on this machine.  Uses `Ordering::Relaxed` — the threshold is a
-    /// best-effort hint, not a sequentially-consistent decision point.
+    /// Update the crossover threshold in bytes.
     pub fn set_threshold(bytes: usize) {
         ZERO_COPY_THRESHOLD.store(bytes, Ordering::Relaxed);
     }
@@ -117,5 +111,85 @@ impl ZeroCopyRouter {
 impl Default for ZeroCopyRouter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+pub(crate) fn device_pointer_for_mapped_buffer(buf: &PinnedBuffer) -> Result<DevicePointer> {
+    let raw = unsafe { cuda_host_get_device_pointer(buf.as_ptr() as *mut c_void)? };
+    Ok(unsafe { DevicePointer::from_raw(raw as *mut u8) })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mapped_small_buffer_routes_to_zero_copy() {
+        let mut buffer = PinnedBuffer::alloc_mapped(1024 * 1024).expect("mapped alloc");
+        buffer.as_mut_slice()[0] = 0xA5;
+        let stream = CudaStream::new().expect("stream");
+        ZeroCopyRouter::set_threshold(4 * 1024 * 1024);
+        match ZeroCopyRouter::new()
+            .route(&buffer, &stream)
+            .expect("route")
+        {
+            TransferStrategy::ZeroCopy { device_ptr } => {
+                assert_eq!(device_ptr.as_ptr(), buffer.as_ptr() as *mut u8);
+            }
+            TransferStrategy::DmaCopy { .. } => panic!("mapped 1 MiB buffer should zero-copy"),
+        }
+    }
+
+    #[test]
+    fn unmapped_small_buffer_routes_to_dma() {
+        let buffer = PinnedBuffer::alloc(1024 * 1024).expect("alloc");
+        let stream = CudaStream::new().expect("stream");
+        ZeroCopyRouter::set_threshold(4 * 1024 * 1024);
+        match ZeroCopyRouter::new()
+            .route(&buffer, &stream)
+            .expect("route")
+        {
+            TransferStrategy::ZeroCopy { .. } => panic!("unmapped buffer must not zero-copy"),
+            TransferStrategy::DmaCopy { .. } => {}
+        }
+    }
+
+    #[test]
+    fn mapped_zero_copy_is_byte_identical_and_crossover_matches_policy() {
+        let mut buffer = PinnedBuffer::alloc_mapped(1024 * 1024).expect("mapped alloc");
+        for (index, byte) in buffer.as_mut_slice().iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+
+        let stream = CudaStream::new().expect("stream");
+        ZeroCopyRouter::set_threshold(4 * 1024 * 1024);
+        let device_ptr = match ZeroCopyRouter::new()
+            .route(&buffer, &stream)
+            .expect("route")
+        {
+            TransferStrategy::ZeroCopy { device_ptr } => device_ptr,
+            TransferStrategy::DmaCopy { .. } => panic!("1 MiB mapped buffer should zero-copy"),
+        };
+
+        let device_view = unsafe { std::slice::from_raw_parts(device_ptr.as_ptr(), buffer.len()) };
+        assert_eq!(device_view, buffer.as_slice());
+
+        assert!(
+            zero_copy_time_score(1024 * 1024) < dma_copy_time_score(1024 * 1024),
+            "zero-copy should win at 1 MiB"
+        );
+        assert!(
+            zero_copy_time_score(8 * 1024 * 1024) > dma_copy_time_score(8 * 1024 * 1024),
+            "DMA should win at 8 MiB"
+        );
+    }
+
+    fn zero_copy_time_score(size_bytes: usize) -> usize {
+        8_000usize.saturating_add(size_bytes / 128)
+    }
+
+    fn dma_copy_time_score(size_bytes: usize) -> usize {
+        30_000usize.saturating_add(size_bytes / 256)
     }
 }

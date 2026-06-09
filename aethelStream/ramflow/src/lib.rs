@@ -15,13 +15,14 @@
 //   use ramflow::{Result, RamFlowError};
 
 #![warn(missing_docs, clippy::all)]
+#![deny(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
 #![cfg_attr(not(feature = "cuda"), allow(dead_code))]
 
 //! **ramflow** — high-throughput memory orchestration for AethelStream.
 //!
 //! Implements five novel algorithms:
 //! 1. Phase-aware predictive pool allocation
-//! 2. Tensor-size-aware hybrid zero-copy routing  
+//! 2. Tensor-size-aware hybrid zero-copy routing
 //! 3. Memory/I/O co-scheduler with pressure feedback
 //! 4. Tensor slab packing for co-traveling small tensors
 //! 5. Per-layer exponentially weighted overflow density scaling
@@ -29,42 +30,50 @@
 // ---------------------------------------------------------------------------
 // Error / Result — declared first so all submodules can use ramflow::Result
 // ---------------------------------------------------------------------------
+/// Structured error types and `Result` alias for the entire crate.
 pub mod error;
 pub use error::{RamFlowError, Result};
 
 // ---------------------------------------------------------------------------
 // Allocator — pinned host memory, RAII drop guard
 // ---------------------------------------------------------------------------
+/// Page-locked host-memory allocator: `PinnedBuffer` and its `Drop` guard.
 pub mod allocator;
 
 // ---------------------------------------------------------------------------
 // Pool — ring buffers, slab packer, slow path, TensorLocationDict
 // ---------------------------------------------------------------------------
+/// Pre-allocated pool rings, tensor slab packer, and tensor location index.
 pub mod pool;
 
 // ---------------------------------------------------------------------------
 // CUDA bridge — streams, zero-copy router, raw bindings
 // ---------------------------------------------------------------------------
+/// CUDA runtime bridge: stream handle, zero-copy router, and FFI bindings.
 pub mod cuda_bridge;
 
 // ---------------------------------------------------------------------------
 // NVMe I/O — io_uring, fd table, prefetch engine, write budget
 // ---------------------------------------------------------------------------
+/// Zero-syscall NVMe I/O engine: io_uring, fd table, prefetch, write budget.
 pub mod nvme;
 
 // ---------------------------------------------------------------------------
 // Phase manager — TrainingPhase, PhaseClassifier, Warmup profiler, rebalancer
 // ---------------------------------------------------------------------------
+/// Training-phase management: classifier, warm-up profiler, pool rebalancer.
 pub mod phase;
 
 // ---------------------------------------------------------------------------
 // Kernel wrappers — thin Rust wrappers around compiled .cu kernels
 // ---------------------------------------------------------------------------
+/// Thin Rust wrappers around compiled CUDA kernels.
 pub mod kernels;
 
 // ---------------------------------------------------------------------------
 // Scheduler — co-scheduler, pressure gauge, per-layer scale table
 // ---------------------------------------------------------------------------
+/// Memory-pressure gauge, I/O co-scheduler, and per-layer loss scale table.
 pub mod scheduler;
 
 // ---------------------------------------------------------------------------

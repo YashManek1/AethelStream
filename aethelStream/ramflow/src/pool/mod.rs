@@ -1,129 +1,166 @@
 // src/pool/mod.rs — pool module root
 //
-// Sprint 0: all types and submodule declarations. No logic runs yet.
-// The key exported types are:
-//   - PoolRegistry  — central registry routing claim() calls to the right ring
-//   - PoolSlot      — RAII guard that returns its ring slot on drop
-//   - LayerKind     — discriminant for which pool a tensor goes into
-//   - TensorSlab    — per-layer packed small-tensor allocation (Algorithm 5)
-//   - TensorLocationDict — loaded from shard_index.json (Module 1 output)
+// Sprint 3A: PoolSlot upgraded to real RAII; PoolRegistry re-exported from subpools.
 
+/// Lock-free ring buffer with atomic claim/release and phase-fence resize.
 pub mod ring_buffer;
+/// Slab packer: merges co-traveling small tensors into one pinned allocation.
 pub mod slab;
+/// Slow-path allocator: blocks the training loop on pool exhaustion.
 pub mod slow_path;
+/// `PoolRegistry`: central registry owning all pool rings.
 pub mod subpools;
+/// `TensorLocationDict`: maps `(layer, name)` → on-disk shard location.
 pub mod tensor_location;
 
-pub use tensor_location::{TensorInfo, TensorLocation, TensorLocationDict};
-pub use slab::TensorSlab;
 pub use ring_buffer::RingBuffer;
+pub use slab::TensorSlab;
+pub use subpools::{EmbeddingFallbackMode, PoolRegistry, SlabInitMode};
+pub use tensor_location::{TensorInfo, TensorLocation, TensorLocationDict};
+
+use std::mem::ManuallyDrop;
+use std::sync::Arc;
+
+use crate::allocator::PinnedBuffer;
 
 // ---------------------------------------------------------------------------
-// LayerKind — discriminant for pool routing
+// LayerKind — discriminant for pool routing (unchanged from Sprint 0)
 // ---------------------------------------------------------------------------
 
 /// Determines which pool ring receives a claim or return.
 ///
-/// Matches the four pool categories from the spec:
+/// Matches the four pool categories from the AethelStream spec:
 /// attention, mlp, norm, embedding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LayerKind {
+    /// Attention block: Q, K, V, and output projections.
     Attention,
+    /// MLP block: up-projection, gate, and down-projection weights.
     Mlp,
+    /// Normalisation layers: LayerNorm weight and bias pairs.
     Norm,
+    /// Embedding table tensors.
     Embedding,
 }
 
 // ---------------------------------------------------------------------------
-// PoolSlot — RAII claim on one ring-buffer slot
+// PoolSlot — RAII claim guard (real implementation, Sprint 3A)
 // ---------------------------------------------------------------------------
 
-/// An active claim on a single pool slot.
+/// An active claim on a single pool ring slot.
 ///
-/// The slot is returned to the ring automatically when this value is dropped,
-/// even on panic.  This is the mechanism that prevents pool starvation from
-/// leaked claims.
+/// Holds the claimed [`PinnedBuffer`] and a reference to the owning
+/// [`RingBuffer`].  When dropped, the buffer is returned to the ring —
+/// even on panic — preventing pool starvation.
 ///
-/// # Sprint 0 contract
-/// Compiles; the backing `buf` pointer is null; calling any method panics.
+/// # Invariants
+///
+/// - `buffer` is valid for the lifetime of this `PoolSlot`.
+/// - Only one `PoolSlot` for a given `slot_index` exists at any time
+///   (enforced by the ring's atomic accounting).
+/// - `drop` is the only code that calls `RingBuffer::release`; no other
+///   code moves the buffer out of `buffer`.
 pub struct PoolSlot {
-    _opaque: (),
+    /// The ring buffer this slot belongs to.
+    ///
+    /// Kept as `Arc` so the ring stays alive at least as long as the slot,
+    /// even if the `PoolRegistry` that created it is dropped first.
+    pub(crate) ring: Option<Arc<RingBuffer>>,
+
+    /// Stable slot index within the ring — used to re-insert the buffer on drop.
+    pub(crate) slot_index: usize,
+
+    /// The pinned buffer for this slot.
+    ///
+    /// Wrapped in `ManuallyDrop` so we can move it out in `drop` without a
+    /// double-free.  `drop` is the only place that calls `ManuallyDrop::take`.
+    pub(crate) buffer: ManuallyDrop<PinnedBuffer>,
+}
+
+impl PoolSlot {
+    /// Construct a slot owned by a pool ring.
+    pub(crate) fn pooled(
+        ring: Arc<RingBuffer>,
+        slot_index: usize,
+        buffer: ManuallyDrop<PinnedBuffer>,
+    ) -> Self {
+        PoolSlot {
+            ring: Some(ring),
+            slot_index,
+            buffer,
+        }
+    }
+
+    /// Construct a slow-path overflow slot that is freed directly on drop.
+    pub(crate) fn overflow(buffer: PinnedBuffer) -> Self {
+        PoolSlot {
+            ring: None,
+            slot_index: usize::MAX,
+            buffer: ManuallyDrop::new(buffer),
+        }
+    }
+
+    /// Shared reference to the underlying pinned buffer.
+    ///
+    /// Valid for the lifetime of this `PoolSlot`.
+    pub fn buffer(&self) -> &PinnedBuffer {
+        // SAFETY: `buffer` is initialised in `try_claim` / `claim_blocking` and
+        // remains valid until `drop` runs.  `ManuallyDrop` prevents automatic
+        // drop; we are the only owner.
+        unsafe { &*std::ptr::addr_of!(*self.buffer) }
+    }
+
+    /// Mutable reference to the underlying pinned buffer.
+    ///
+    /// Valid for the lifetime of this `PoolSlot`.  `&mut self` guarantees
+    /// exclusive access.
+    pub fn buffer_mut(&mut self) -> &mut PinnedBuffer {
+        // SAFETY: same invariants as `buffer`; `&mut self` guarantees no
+        // concurrent access.
+        unsafe { &mut *std::ptr::addr_of_mut!(*self.buffer) }
+    }
+
+    /// Raw mutable pointer to the start of the pinned buffer (for CUDA FFI and
+    /// io_uring write paths).
+    ///
+    /// # Safety
+    ///
+    /// Valid as long as this `PoolSlot` is alive.  The caller must not retain
+    /// the pointer beyond the `PoolSlot`'s lifetime and must not alias it with
+    /// any other reference to the same buffer.
+    pub unsafe fn buffer_ptr(&self) -> *mut u8 {
+        // SAFETY: buffer is valid for the lifetime of self; ManuallyDrop
+        // prevents automatic drop.  We expose a raw pointer so CUDA FFI and
+        // io_uring can write directly into the pinned allocation without an
+        // intermediate slice.
+        self.buffer.as_ptr() as *mut u8
+    }
+
+    /// Byte length of the underlying pinned buffer.
+    pub fn buffer_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// The stable slot index within the ring.
+    pub fn slot_index(&self) -> usize {
+        self.slot_index
+    }
 }
 
 impl Drop for PoolSlot {
     fn drop(&mut self) {
-        // Sprint 0: nothing to return — real impl advances ring tail and
-        // decrements the active-claims counter (phase fence).
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PoolRegistry — central allocator, owns all ring buffers and slabs
-// ---------------------------------------------------------------------------
-
-/// Central registry of all pool shards.
-///
-/// Routes `claim(LayerKind)` to the correct ring buffer, maintains the
-/// active-claims counter used by the phase fence, and owns all [`TensorSlab`]s.
-///
-/// # Sprint 0 contract
-/// Compiles; all methods `unimplemented!`.
-pub struct PoolRegistry {
-    _opaque: (),
-}
-
-impl PoolRegistry {
-    /// Construct a registry from a hardware profile and tensor location dict.
-    ///
-    /// Pools are initialised at the *Recomputation* phase profile (the worst
-    /// case) so that the rebalancer only ever needs to shrink, never to
-    /// emergency-grow during active training.
-    #[allow(unused_variables)]
-    pub fn new(
-        profile: &crate::phase::classifier::PhaseMemoryProfile,
-        dict: &TensorLocationDict,
-        zero_copy_threshold: usize,
-    ) -> crate::Result<Self> {
-        unimplemented!("PoolRegistry::new — Sprint 0 stub")
-    }
-
-    /// Convenience constructor with default (Recomputation-sized) profiles.
-    pub fn with_defaults() -> crate::Result<Self> {
-        unimplemented!("PoolRegistry::with_defaults — Sprint 0 stub")
-    }
-
-    /// Claim one slot of the pool appropriate for `kind`.
-    ///
-    /// On pool exhaustion the slow-path handler fires:
-    ///   1. Signals the co-scheduler to pause prefetch immediately.
-    ///   2. Attempts to reclaim the oldest reclaimable buffer.
-    ///   3. Falls back to a fresh `allocate_pinned` call with a `warn!` log.
-    #[allow(unused_variables)]
-    pub fn claim(&self, kind: LayerKind) -> crate::Result<PoolSlot> {
-        unimplemented!("PoolRegistry::claim — Sprint 0 stub")
-    }
-
-    /// Number of currently-claimed slots across all pools.
-    pub fn total_claimed_slots(&self) -> usize {
-        unimplemented!("PoolRegistry::total_claimed_slots — Sprint 0 stub")
-    }
-
-    /// Total slot capacity across all pools.
-    pub fn total_capacity(&self) -> usize {
-        unimplemented!("PoolRegistry::total_capacity — Sprint 0 stub")
-    }
-
-    /// Return a reference to the pre-built slab for `layer_idx`.
-    ///
-    /// All 80 layer slabs are built at startup; this is a zero-allocation
-    /// index operation during training.
-    #[allow(unused_variables)]
-    pub fn slab_for_layer(&self, layer_idx: u32) -> Option<&TensorSlab> {
-        unimplemented!("PoolRegistry::slab_for_layer — Sprint 0 stub")
-    }
-
-    /// Total bytes currently allocated (across all rings + all slabs).
-    pub fn bytes_allocated(&self) -> usize {
-        unimplemented!("PoolRegistry::bytes_allocated — Sprint 0 stub")
+        // SAFETY: `buffer` was initialised in `try_claim` / `claim_blocking`
+        // exactly once.  `ManuallyDrop::take` moves the value out, transferring
+        // ownership to `release`.  This is the only code that calls `take`, so
+        // there is no double-take.  After `take`, the `ManuallyDrop` wrapper
+        // contains uninitialised memory, but this struct is immediately dropped
+        // (we are inside `drop`), so no subsequent code can access it.
+        let buffer = unsafe { ManuallyDrop::take(&mut self.buffer) };
+        if let Some(ring) = &self.ring {
+            // Return the buffer to the ring — this is guaranteed to run even on panic.
+            ring.release(self.slot_index, ManuallyDrop::new(buffer));
+        } else {
+            drop(buffer);
+        }
     }
 }

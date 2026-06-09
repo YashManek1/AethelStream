@@ -24,8 +24,8 @@
 //     Windows: _aligned_free (matches _aligned_malloc)
 //   Using libc::free on Windows for _aligned_malloc memory is undefined behaviour.
 
-use std::os::raw::c_void;
 use crate::cuda_bridge::bindings::cuda_host_unregister;
+use std::os::raw::c_void;
 
 // ─── Platform-specific free ────────────────────────────────────────────────
 

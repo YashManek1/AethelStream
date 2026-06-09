@@ -111,11 +111,13 @@ fn unit_slice_length() {
     }
 }
 
-/// as_ptr() must be non-null and aligned to 64 bytes.
+/// as_ptr() must be non-null and aligned to 512 bytes (O_DIRECT sector size).
 /// as_mut_ptr() must return the same address.
 #[test]
 fn unit_pointer_alignment() {
-    // Test multiple sizes to ensure alignment holds regardless of size
+    // Test multiple sizes to ensure 512-byte alignment holds regardless of size.
+    // O_DIRECT requires buffer address, file offset, and length to all be
+    // multiples of 512 (NVMe logical-sector size).
     let sizes = [1_usize, 63, 64, 65, 4097, 1_572_864];
     for &n in &sizes {
         let mut buf = PinnedBuffer::alloc(n).expect("alloc failed");
@@ -125,14 +127,38 @@ fn unit_pointer_alignment() {
 
         assert_ne!(ptr, 0, "as_ptr() returned null for size {n}");
         assert_eq!(
-            ptr % 64,
+            ptr % 512,
             0,
-            "as_ptr() not 64-byte aligned for size {n}: offset = {}",
-            ptr % 64
+            "as_ptr() not 512-byte aligned for size {n}: offset = {} (O_DIRECT requires 512)",
+            ptr % 512
         );
         assert_eq!(
             ptr, ptr_mut,
             "as_ptr() and as_mut_ptr() differ for size {n}"
+        );
+    }
+}
+
+/// Every PinnedBuffer must satisfy the O_DIRECT triple: address, offset, length
+/// all multiples of 512.  This test verifies the address half.
+#[test]
+fn unit_alignment_512_satisfies_o_direct() {
+    // posix_memalign(512) guarantees the returned address is a multiple of 512.
+    // This test documents the invariant and will catch any regression that
+    // lowers PINNED_ALIGN below 512.
+    for size in [512_usize, 1024, 4096, 131_072, 2_202_009] {
+        let buf = PinnedBuffer::alloc(size).expect("alloc failed");
+        let addr = buf.as_ptr() as usize;
+        assert_eq!(
+            addr % 512,
+            0,
+            "buffer for size {size}: address {addr:#x} is not 512-byte aligned"
+        );
+        // 512-byte alignment also implies 64-byte (cache-line) alignment.
+        assert_eq!(
+            addr % 64,
+            0,
+            "not 64-byte aligned (regression): addr={addr:#x}"
         );
     }
 }
@@ -562,7 +588,11 @@ fn simulate_model_layer_streaming() {
                 buf.as_ptr()
             );
             assert_eq!(buf.len(), attention_block_bytes);
-            assert_eq!(buf.as_ptr() as usize % 64, 0, "not 64-byte aligned!");
+            assert_eq!(
+                buf.as_ptr() as usize % 512,
+                0,
+                "not 512-byte aligned (O_DIRECT requirement)!"
+            );
             buf
         })
         .collect();
@@ -701,16 +731,16 @@ fn simulate_exact_240_mb_pinning() {
             .unwrap_or_else(|e| panic!("alloc chunk {i} ({size} B) failed: {e}"));
         buf.as_mut_slice().fill(i as u8 + 1);
         println!(
-            "  ✓ Chunk {i}: {:.3} MB at {:p} (aligned: {})",
+            "  ✓ Chunk {i}: {:.3} MB at {:p} (512-aligned: {})",
             size as f64 / 1e6,
             buf.as_ptr(),
-            buf.as_ptr() as usize % 64 == 0
+            buf.as_ptr() as usize % 512 == 0
         );
         assert_eq!(buf.len(), size, "chunk {i} size wrong");
         assert_eq!(
-            buf.as_ptr() as usize % 64,
+            buf.as_ptr() as usize % 512,
             0,
-            "chunk {i} not 64-byte aligned"
+            "chunk {i} not 512-byte aligned (O_DIRECT requirement)"
         );
         buffers.push(buf);
     }

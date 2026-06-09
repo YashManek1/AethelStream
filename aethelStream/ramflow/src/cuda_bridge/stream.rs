@@ -8,7 +8,7 @@
 // In mock-cuda mode, check_overflow_fp16 is a pure-Rust stub that scans the
 // host-side slice directly. This lets all Sprint 2 tests run on CI without a GPU.
 
-use crate::{RamFlowError, Result};
+use crate::Result;
 
 // ===========================================================================
 // CudaStream
@@ -102,6 +102,64 @@ impl Drop for CudaStream {
 // Overflow check — the Sprint 2 core deliverable
 // ===========================================================================
 
+/// Handle returned by `launch_overflow_check_fp16_async`.
+///
+/// In mock-cuda mode the result is computed immediately on the host;
+/// `complete()` returns it without any GPU sync. In the real CUDA path
+/// (Sprint 4+), `complete()` will synchronize a device event instead of
+/// blocking the whole stream.
+pub struct OverflowCheckToken {
+    immediate_result: Option<bool>,
+}
+
+impl OverflowCheckToken {
+    /// Resolve the overflow check result.
+    pub fn complete(self) -> bool {
+        self.immediate_result.unwrap_or(false)
+    }
+}
+
+/// Launch an FP16 overflow scan asynchronously and return a token for the result.
+///
+/// In mock-cuda mode the scan runs immediately on the host slice using the
+/// same bitmask as `check_overflow_fp16`; `complete()` returns without any
+/// GPU synchronization. In the real CUDA path (Sprint 4+) this will post a
+/// kernel launch and record an event — `complete()` waits on the event rather
+/// than blocking the whole stream with `cudaStreamSynchronize`.
+///
+/// # Safety
+/// `grad_ptr` must be valid for `n` elements. In mock-cuda mode it is treated
+/// as a host pointer; in the real CUDA path it must be a device pointer.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn launch_overflow_check_fp16_async(
+    grad_ptr: *const u16,
+    n: usize,
+    _stream: &CudaStream,
+) -> OverflowCheckToken {
+    if n == 0 {
+        return OverflowCheckToken {
+            immediate_result: Some(false),
+        };
+    }
+
+    #[cfg(feature = "mock-cuda")]
+    {
+        // Safety: caller guarantees grad_ptr is valid for n elements and is a
+        // host pointer in mock-cuda mode. The slice lifetime is bounded by this
+        // function; OverflowCheckToken stores only the computed bool.
+        let slice = unsafe { std::slice::from_raw_parts(grad_ptr, n) };
+        let has_overflow = slice.iter().any(|&bits| (bits & 0x7C00u16) == 0x7C00u16);
+        OverflowCheckToken {
+            immediate_result: Some(has_overflow),
+        }
+    }
+
+    #[cfg(not(feature = "mock-cuda"))]
+    {
+        todo!("Real CUDA async path — Sprint 4: post kernel + record event; complete() waits on event")
+    }
+}
+
 /// Scan a device-side FP16 tensor for NaN or Inf elements.
 ///
 /// # Real CUDA path
@@ -124,10 +182,11 @@ impl Drop for CudaStream {
 ///
 /// # Returns
 /// `true` if any element is NaN or Inf, `false` otherwise.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn check_overflow_fp16(
     grad_ptr: *const u16, // FP16 stored as u16 bits; avoids half-float dep in Rust
     n: usize,
-    stream: &CudaStream,
+    _stream: &CudaStream,
 ) -> bool {
     if n == 0 {
         return false;
@@ -212,6 +271,7 @@ unsafe fn cuda_stream_destroy(stream: *mut std::os::raw::c_void) -> i32 {
 //   cargo test --no-default-features --features mock-cuda
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::mem::ManuallyDrop;
@@ -320,6 +380,24 @@ mod tests {
                 iteration % 10_000
             );
         }
+    }
+
+    #[test]
+    fn async_overflow_token_matches_sync_check() {
+        // Verifies that launch_overflow_check_fp16_async + complete() agrees
+        // with the synchronous check_overflow_fp16 on both clean and dirty arrays.
+        let data = vec![fp16_one(); 1000];
+        let stream = make_stream();
+        let token = launch_overflow_check_fp16_async(data.as_ptr(), data.len(), &stream);
+        assert!(
+            !token.complete(),
+            "clean array must not trigger overflow via async path"
+        );
+
+        let mut dirty = vec![fp16_one(); 1000];
+        dirty[500] = fp16_nan();
+        let token2 = launch_overflow_check_fp16_async(dirty.as_ptr(), dirty.len(), &stream);
+        assert!(token2.complete(), "NaN must be detected via async path");
     }
 
     #[test]

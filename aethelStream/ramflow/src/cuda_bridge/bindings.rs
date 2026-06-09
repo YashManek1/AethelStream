@@ -67,6 +67,9 @@ pub const CUDA_HOST_REGISTER_DEFAULT: u32 = 0;
 /// developers have a single canonical reference.
 pub const CUDA_HOST_REGISTER_MAPPED: u32 = 2;
 
+/// Host-to-device direction for `cudaMemcpyAsync`.
+pub const CUDA_MEMCPY_HOST_TO_DEVICE: u32 = 1;
+
 // ===========================================================================
 // REAL CUDA path
 // ===========================================================================
@@ -98,6 +101,25 @@ extern "C" {
     /// # Returns
     /// `0` (cudaSuccess) on success; a non-zero `cudaError_t` on failure.
     pub fn cudaHostUnregister(ptr: *mut c_void) -> CudaError;
+
+    /// Return the device-side UVA pointer for mapped host memory.
+    pub fn cudaHostGetDevicePointer(
+        device_ptr: *mut *mut c_void,
+        host_ptr: *mut c_void,
+        flags: u32,
+    ) -> CudaError;
+
+    /// Allocate device memory asynchronously on `stream`.
+    pub fn cudaMallocAsync(ptr: *mut *mut c_void, size: usize, stream: *mut c_void) -> CudaError;
+
+    /// Copy memory asynchronously on `stream`.
+    pub fn cudaMemcpyAsync(
+        dst: *mut c_void,
+        src: *const c_void,
+        count: usize,
+        kind: u32,
+        stream: *mut c_void,
+    ) -> CudaError;
 }
 
 // ===========================================================================
@@ -110,14 +132,14 @@ extern "C" {
 /// alignment and exact size, so all allocation-precision tests remain
 /// meaningful even on CI.
 /// Named with camelCase to match the CUDA runtime symbol exactly.
+///
+/// # Safety
+/// Caller must ensure `_ptr` was allocated by the platform aligned allocator
+/// and `_size` matches the allocation.  In mock mode this is a no-op.
 #[cfg(feature = "mock-cuda")]
 #[allow(non_snake_case)]
 #[inline(always)]
-pub unsafe fn cudaHostRegister(
-    _ptr: *mut c_void,
-    _size: usize,
-    _flags: u32,
-) -> CudaError {
+pub unsafe fn cudaHostRegister(_ptr: *mut c_void, _size: usize, _flags: u32) -> CudaError {
     0 // cudaSuccess
 }
 
@@ -128,11 +150,87 @@ pub unsafe fn cudaHostRegister(
 /// in mock mode the call is free (inlined away) but the ordering
 /// contract is still exercised.
 /// Named with camelCase to match the CUDA runtime symbol exactly.
+///
+/// # Safety
+/// `_ptr` must be a pointer previously passed to `cudaHostRegister`.
+/// In mock mode this is a no-op.
 #[cfg(feature = "mock-cuda")]
 #[allow(non_snake_case)]
 #[inline(always)]
 pub unsafe fn cudaHostUnregister(_ptr: *mut c_void) -> CudaError {
     0 // cudaSuccess
+}
+
+/// Mock `cudaHostGetDevicePointer`: UVA pointer is the host pointer.
+///
+/// # Safety
+/// `device_ptr` must be non-null and point to a valid pointer-sized slot.
+/// `host_ptr` must be a pointer previously registered with `cudaHostRegister`
+/// using the `MAPPED` flag.  In mock mode, writes `host_ptr` into `*device_ptr`.
+#[cfg(feature = "mock-cuda")]
+#[allow(non_snake_case)]
+#[inline(always)]
+pub unsafe fn cudaHostGetDevicePointer(
+    device_ptr: *mut *mut c_void,
+    host_ptr: *mut c_void,
+    _flags: u32,
+) -> CudaError {
+    if !device_ptr.is_null() {
+        *device_ptr = host_ptr;
+    }
+    0
+}
+
+/// Mock `cudaMallocAsync`: allocate host memory to stand in for VRAM.
+///
+/// # Safety
+/// `ptr` must be non-null and point to a valid pointer-sized slot.
+/// The returned allocation must be freed by the matching `cudaFreeAsync` (or
+/// `std::alloc::dealloc` in mock mode) before the slot is abandoned.
+#[cfg(feature = "mock-cuda")]
+#[allow(non_snake_case)]
+#[inline(always)]
+pub unsafe fn cudaMallocAsync(
+    ptr: *mut *mut c_void,
+    size: usize,
+    _stream: *mut c_void,
+) -> CudaError {
+    if ptr.is_null() {
+        return 1;
+    }
+    let layout = match std::alloc::Layout::from_size_align(size.max(1), 512) {
+        Ok(layout) => layout,
+        Err(_) => return 1,
+    };
+    let allocation = std::alloc::alloc(layout);
+    if allocation.is_null() {
+        return 2;
+    }
+    *ptr = allocation as *mut c_void;
+    0
+}
+
+/// Mock `cudaMemcpyAsync`: perform an immediate host copy.
+///
+/// # Safety
+/// `dst` must be writable for `count` bytes.  `src` must be readable for
+/// `count` bytes.  Regions must not overlap.  In mock mode the copy is
+/// synchronous via `std::ptr::copy_nonoverlapping`.
+#[cfg(feature = "mock-cuda")]
+#[allow(non_snake_case)]
+#[inline(always)]
+pub unsafe fn cudaMemcpyAsync(
+    dst: *mut c_void,
+    src: *const c_void,
+    count: usize,
+    _kind: u32,
+    _stream: *mut c_void,
+) -> CudaError {
+    if dst.is_null() || src.is_null() {
+        return 1;
+    }
+    std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, count);
+    0
 }
 
 // ===========================================================================
@@ -145,11 +243,7 @@ pub unsafe fn cudaHostUnregister(_ptr: *mut c_void) -> CudaError {
 ///
 /// # Safety
 /// See module-level safety contract.
-pub unsafe fn cuda_host_register(
-    ptr: *mut c_void,
-    size: usize,
-    flags: u32,
-) -> crate::Result<()> {
+pub unsafe fn cuda_host_register(ptr: *mut c_void, size: usize, flags: u32) -> crate::Result<()> {
     let rc = cudaHostRegister(ptr, size, flags);
     if rc == 0 {
         Ok(())
@@ -164,6 +258,53 @@ pub unsafe fn cuda_host_register(
 /// See module-level safety contract.
 pub unsafe fn cuda_host_unregister(ptr: *mut c_void) -> crate::Result<()> {
     let rc = cudaHostUnregister(ptr);
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(crate::RamFlowError::CudaError(rc))
+    }
+}
+
+/// Obtain a mapped host allocation's device-visible pointer.
+///
+/// # Safety
+/// `host_ptr` must belong to a live allocation registered with
+/// `cudaHostRegisterMapped`.
+pub unsafe fn cuda_host_get_device_pointer(host_ptr: *mut c_void) -> crate::Result<*mut c_void> {
+    let mut device_ptr: *mut c_void = std::ptr::null_mut();
+    let rc = cudaHostGetDevicePointer(&mut device_ptr, host_ptr, 0);
+    if rc == 0 {
+        Ok(device_ptr)
+    } else {
+        Err(crate::RamFlowError::CudaError(rc))
+    }
+}
+
+/// Allocate device memory asynchronously on `stream`.
+///
+/// # Safety
+/// `stream` must be a valid CUDA stream for the current device.
+pub unsafe fn cuda_malloc_async(size: usize, stream: *mut c_void) -> crate::Result<*mut c_void> {
+    let mut device_ptr: *mut c_void = std::ptr::null_mut();
+    let rc = cudaMallocAsync(&mut device_ptr, size, stream);
+    if rc == 0 {
+        Ok(device_ptr)
+    } else {
+        Err(crate::RamFlowError::CudaError(rc))
+    }
+}
+
+/// Copy host memory to device memory asynchronously on `stream`.
+///
+/// # Safety
+/// `dst` and `src` must be valid for `count` bytes and non-overlapping.
+pub unsafe fn cuda_memcpy_async_host_to_device(
+    dst: *mut c_void,
+    src: *const c_void,
+    count: usize,
+    stream: *mut c_void,
+) -> crate::Result<()> {
+    let rc = cudaMemcpyAsync(dst, src, count, CUDA_MEMCPY_HOST_TO_DEVICE, stream);
     if rc == 0 {
         Ok(())
     } else {

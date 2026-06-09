@@ -44,6 +44,15 @@ pub enum RamFlowError {
     /// Shard index or hardware profile JSON could not be parsed.
     #[error("configuration error: {0}")]
     ConfigError(String),
+
+    /// A requested tensor name was not present in the layer index or slab.
+    #[error("tensor not found: layer {layer_idx}, tensor {name}")]
+    TensorNotFound {
+        /// Layer index whose tensor table was queried.
+        layer_idx: u32,
+        /// Tensor name that was requested.
+        name: String,
+    },
 }
 
 /// Crate-wide `Result` alias.  Every public API that can fail returns this.

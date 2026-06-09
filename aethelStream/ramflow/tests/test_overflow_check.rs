@@ -41,7 +41,10 @@ fn test_overflow_check_detects_expected_patterns() {
 
     let clean = vec![fp16_one(); 10_000];
     let clean_overflow = check_overflow_fp16(clean.as_ptr(), clean.len(), &stream);
-    assert!(!clean_overflow, "expected clean array to report no overflow");
+    assert!(
+        !clean_overflow,
+        "expected clean array to report no overflow"
+    );
 }
 
 #[test]

@@ -67,12 +67,9 @@
 use std::os::raw::c_void;
 
 use crate::cuda_bridge::bindings::{
-    cuda_host_register,
-    cuda_host_unregister,
-    CUDA_HOST_REGISTER_DEFAULT,
-    CUDA_HOST_REGISTER_MAPPED,
+    cuda_host_register, cuda_host_unregister, CUDA_HOST_REGISTER_DEFAULT, CUDA_HOST_REGISTER_MAPPED,
 };
-use crate::{Result, RamFlowError};
+use crate::{RamFlowError, Result};
 
 // ===========================================================================
 // Platform-specific aligned allocator
@@ -89,7 +86,7 @@ use crate::{Result, RamFlowError};
 ///   • The pointer MUST be freed with `_aligned_free` (NOT `free`!).
 ///   • We use the libc crate's FFI binding to the Windows CRT.
 mod platform {
-    use crate::{Result, RamFlowError};
+    use crate::{RamFlowError, Result};
 
     /// Allocate `size` bytes aligned to `alignment`.
     ///
@@ -117,9 +114,7 @@ mod platform {
         {
             // _aligned_malloc is the Windows CRT equivalent.
             // It is available via the `libc` crate as `aligned_malloc` on Windows.
-            let ptr = unsafe {
-                libc::aligned_malloc(size_bytes, alignment)
-            };
+            let ptr = unsafe { libc::aligned_malloc(size_bytes, alignment) };
             if ptr.is_null() {
                 return Err(RamFlowError::AllocationFailed(format!(
                     "aligned_malloc({size_bytes} B, align {alignment}) returned null"
@@ -132,8 +127,9 @@ mod platform {
         {
             // Fallback for exotic targets: use std::alloc with Layout.
             use std::alloc::{alloc, Layout};
-            let layout = Layout::from_size_align(size_bytes, alignment)
-                .map_err(|e| RamFlowError::AllocationFailed(format!("aligned layout error: {e}")))?;
+            let layout = Layout::from_size_align(size_bytes, alignment).map_err(|e| {
+                RamFlowError::AllocationFailed(format!("aligned layout error: {e}"))
+            })?;
             // SAFETY: layout.size() > 0 (checked by caller).
             let ptr = unsafe { alloc(layout) };
             if ptr.is_null() {
@@ -171,16 +167,22 @@ mod platform {
 
 // ─── Alignment constant ────────────────────────────────────────────────────
 
-/// 64 bytes = one CPU cache line.
+/// 512 bytes = NVMe logical-sector size (also a multiple of one CPU cache line).
 ///
-/// The GPU DMA engine reads memory in 64-byte chunks aligned to 64-byte
-/// boundaries.  Allocating at a 64-byte boundary ensures:
-///   • The first DMA read for any buffer costs exactly one chunk.
-///   • No buffer ever "straddles" a cache-line boundary on its first byte.
+/// O_DIRECT requires the buffer address, the shard byte offset, and the transfer
+/// length to all be multiples of the device's logical-sector size (512 bytes for
+/// NVMe). Using 64-byte alignment satisfies DMA cache-line requirements but NOT
+/// the O_DIRECT constraint: `posix_memalign(64)` returns an address that is a
+/// multiple of 64, which is only a multiple of 512 for 1-in-8 allocations.
+/// Raising to 512 guarantees every PinnedBuffer can safely back an `io_uring`
+/// `IORING_OP_READ` issued with O_DIRECT without an EINVAL from the kernel.
 ///
-/// posix_memalign requires alignment to be a power of two AND a multiple of
-/// `sizeof(void*)` (8 bytes on 64-bit).  64 satisfies both.
-const PINNED_ALIGN: usize = 64;
+/// 512 is a power of two and a multiple of `sizeof(void*)` (8 on 64-bit):
+///   • `posix_memalign`: alignment must be a power of two ≥ `sizeof(void*)`.
+///   • `_aligned_malloc` (Windows CRT): same constraint.
+///   • `std::alloc::Layout`: alignment must be a power of two.
+/// All three constraints are satisfied.
+const PINNED_ALIGN: usize = 512;
 
 // ===========================================================================
 // PinnedBuffer
@@ -189,9 +191,9 @@ const PINNED_ALIGN: usize = 64;
 /// Page-locked (pinned) host buffer visible to both CPU and GPU.
 ///
 /// # Memory model
-/// Allocated with `posix_memalign(64)` for exact sizing and DMA alignment.
-/// Registered with the CUDA driver via `cudaHostRegister` to prevent kernel
-/// page migration.
+/// Allocated with `posix_memalign(512)` for exact sizing and O_DIRECT sector
+/// alignment. Registered with the CUDA driver via `cudaHostRegister` to prevent
+/// kernel page migration.
 ///
 /// # Safety
 /// This type holds a raw pointer.  All `unsafe` blocks within are justified
@@ -219,6 +221,15 @@ pub struct PinnedBuffer {
     ///           Required for zero-copy (Sprint 4).  ZeroCopyRouter checks
     ///           this flag before calling `cudaHostGetDevicePointer`.
     is_mapped: bool,
+
+    /// Whether this buffer contains INT8-compressed data (Sprint 5).
+    ///
+    /// When `true`, the content was produced by
+    /// `ramflow_compress_checkpoint_fp16_to_int8` and follows the layout:
+    /// `[n_channels * sizeof(f32) scale bytes] || [n_elements * int8_t]`.
+    /// Set via [`PinnedBuffer::set_compressed`]; read by Module 5 to decide
+    /// whether to decompress before using the buffer as a gradient checkpoint.
+    compressed: bool,
 }
 
 // Safety: PinnedBuffer wraps a raw pointer that was allocated by posix_memalign
@@ -266,13 +277,12 @@ impl PinnedBuffer {
         // posix_memalign, and `bytes` matches the allocation size.
         unsafe {
             cuda_host_register(ptr as *mut c_void, bytes, CUDA_HOST_REGISTER_DEFAULT)
-                .map_err(|e| {
-                    // If registration fails, free the memory immediately to
-                    // avoid a leak (the Drop impl would not call unregister
-                    // since registration never succeeded).
+                .inspect_err(|_| {
+                    // Registration failed: free immediately to avoid a leak.
+                    // Drop impl would not call unregister since registration
+                    // never succeeded.
                     // SAFETY: ptr was returned by posix_memalign_alloc.
                     platform::free_aligned(ptr);
-                    e
                 })?;
         }
 
@@ -280,6 +290,7 @@ impl PinnedBuffer {
             ptr,
             size_bytes: bytes,
             is_mapped: false,
+            compressed: false,
         })
     }
 
@@ -309,10 +320,9 @@ impl PinnedBuffer {
         // SAFETY: Same as alloc. Flag is MAPPED for UVA.
         unsafe {
             cuda_host_register(ptr as *mut c_void, bytes, CUDA_HOST_REGISTER_MAPPED)
-                .map_err(|e| {
+                .inspect_err(|_| {
                     // SAFETY: ptr was returned by posix_memalign_alloc.
                     platform::free_aligned(ptr);
-                    e
                 })?;
         }
 
@@ -320,6 +330,7 @@ impl PinnedBuffer {
             ptr,
             size_bytes: bytes,
             is_mapped: true,
+            compressed: false,
         })
     }
 
@@ -329,10 +340,10 @@ impl PinnedBuffer {
 
     /// Call the platform-appropriate aligned allocator and return the pointer.
     ///
-    /// | Platform | Function               | Notes                          |
-    /// |----------|------------------------|--------------------------------|
-    /// | Linux    | `posix_memalign(64)`   | POSIX standard, exact size     |
-    /// | Windows  | `_aligned_malloc(64)`  | CRT aligned allocator          |
+    /// | Platform | Function                | Notes                          |
+    /// |----------|-------------------------|--------------------------------|
+    /// | Linux    | `posix_memalign(512)`   | POSIX standard, exact size     |
+    /// | Windows  | `_aligned_malloc(512)`  | CRT aligned allocator          |
     ///
     /// Both return a pointer that must be freed with the corresponding free:
     /// - `libc::free` on Linux
@@ -341,7 +352,7 @@ impl PinnedBuffer {
     /// # Safety invariants on return
     /// The returned pointer is:
     ///   • Non-null (error was checked).
-    ///   • Aligned to `PINNED_ALIGN` (64) bytes.
+    ///   • Aligned to `PINNED_ALIGN` (512) bytes — satisfies O_DIRECT.
     ///   • Points to `size` bytes of writable, uninitialized memory.
     fn posix_memalign_alloc(size: usize) -> Result<*mut u8> {
         platform::allocate_aligned(size, PINNED_ALIGN)
@@ -374,6 +385,27 @@ impl PinnedBuffer {
     #[inline]
     pub fn is_mapped(&self) -> bool {
         self.is_mapped
+    }
+
+    /// Whether this buffer's content has been INT8-compressed (Sprint 5).
+    ///
+    /// When `true`, the bytes contain INT8-quantised activation checkpoints
+    /// preceded by per-channel float32 scale factors.  Set via
+    /// [`PinnedBuffer::set_compressed`] after calling
+    /// `ramflow_compress_checkpoint_fp16_to_int8`.
+    #[inline]
+    pub fn is_compressed(&self) -> bool {
+        self.compressed
+    }
+
+    /// Mark this buffer as INT8-compressed or uncompressed.
+    ///
+    /// Call with `true` immediately after a successful
+    /// `ramflow_compress_checkpoint_fp16_to_int8` kernel invocation.
+    /// Call with `false` after decompression restores FP16 data.
+    #[inline]
+    pub fn set_compressed(&mut self, compressed: bool) {
+        self.compressed = compressed;
     }
 
     /// Read-only byte slice over the entire buffer.

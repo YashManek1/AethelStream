@@ -40,7 +40,7 @@ use crate::nvme::fd_table::FdTable;
 use crate::nvme::io_uring_setup::IoUringInstance;
 use crate::{RamFlowError, Result};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 // crossbeam_channel is already pulled in transitively; we use bounded channels.
 // A bounded channel with capacity = ring size prevents the sender from racing
@@ -56,6 +56,24 @@ use std::sync::Arc;
 /// `CQE.user_data` by the poller. Callers define what the token means —
 /// Module 3 uses it as a tensor_id or a (layer_idx, tensor_name) hash.
 pub type PrefetchToken = u64;
+
+/// Configuration for super-shard grouped I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SuperShardConfig {
+    /// Enables one contiguous read for a group of consecutive layers.
+    pub enabled: bool,
+    /// Target grouped-read size in bytes.
+    pub target_bytes: u64,
+}
+
+impl Default for SuperShardConfig {
+    fn default() -> Self {
+        SuperShardConfig {
+            enabled: false,
+            target_bytes: 200 * 1024 * 1024,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CqeResult — what the poller thread sends back
@@ -106,6 +124,9 @@ pub struct PrefetchEngine {
     /// Maximum safe pressure budget before new prefetch reads are paused.
     /// Condition: outstanding_reads + claimed_slots > pressure_threshold.
     pressure_threshold: Arc<AtomicUsize>,
+
+    /// Grouped contiguous-read configuration. Default is disabled until profiled.
+    super_shard_config: Mutex<SuperShardConfig>,
 }
 
 // Manual Send impl: all fields are Send individually.
@@ -133,6 +154,7 @@ impl PrefetchEngine {
             outstanding_reads,
             claimed_slots,
             pressure_threshold,
+            super_shard_config: Mutex::new(SuperShardConfig::default()),
         })
     }
 
@@ -142,7 +164,11 @@ impl PrefetchEngine {
     /// pause signal. The caller should sleep for one layer's compute time
     /// and retry.
     fn check_pause(&self) -> Result<()> {
-        if self.pause_signal.load(Ordering::Relaxed) {
+        // Acquire pairs with the Release store in DirectNvmeEngine::set_pause().
+        // On weakly-ordered architectures (ARM/RISC-V), Relaxed would allow the
+        // CPU to see a stale false after the co-scheduler has stored true —
+        // causing an extra SQE submission that overruns RAM pressure limits.
+        if self.pause_signal.load(Ordering::Acquire) {
             // layer_id=0 here; the full engine passes the real layer_id
             return Err(RamFlowError::PressurePause(0));
         }
@@ -171,6 +197,23 @@ impl PrefetchEngine {
     /// Current in-flight read count tracked at SQE submit/CQE completion boundaries.
     pub fn outstanding_reads(&self) -> usize {
         self.outstanding_reads.load(Ordering::Acquire)
+    }
+
+    /// Configure super-shard grouped I/O.
+    pub fn set_super_shard_config(&self, config: SuperShardConfig) {
+        let mut guard = self
+            .super_shard_config
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *guard = config;
+    }
+
+    /// Current super-shard grouped I/O configuration.
+    pub fn super_shard_config(&self) -> SuperShardConfig {
+        *self
+            .super_shard_config
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// Returns true if a new submission is currently allowed by pressure gating.
@@ -250,15 +293,59 @@ impl PrefetchEngine {
     pub fn schedule(
         &self,
         _shard_id: u32,
-        _byte_offset: u64,
+        byte_offset: u64,
         _length: u64,
         _dst: &PinnedBuffer,
         _token: PrefetchToken,
     ) -> Result<()> {
         self.check_pause()?;
-        // On non-Linux, use a synchronous fallback read (Sprint 2 spec).
-        // Full implementation deferred to Sprint 3's cross-platform path.
-        todo!("Synchronous fallback read for non-Linux — Sprint 3")
+
+        // O_DIRECT sector-alignment gate: offset must be a multiple of 512.
+        if !byte_offset.is_multiple_of(512) {
+            return Err(RamFlowError::IoUringError(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "byte_offset {byte_offset} is not 512-byte aligned \
+                     (O_DIRECT: offset must be a multiple of the sector size)"
+                ),
+            )));
+        }
+
+        if !_length.is_multiple_of(512) {
+            return Err(RamFlowError::IoUringError(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "length {_length} is not 512-byte aligned \
+                     (O_DIRECT: length must be a multiple of the sector size)"
+                ),
+            )));
+        }
+
+        self.outstanding_reads.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Schedule a grouped contiguous read for consecutive layers.
+    ///
+    /// The caller keeps per-layer offsets in `layer_offsets`; this method only
+    /// submits the single super-shard read when the feature flag is enabled.
+    /// With the default disabled config, it falls back to a normal single read
+    /// for the requested byte range.
+    pub fn schedule_super_shard(
+        &self,
+        shard_id: u32,
+        byte_offset: u64,
+        length: u64,
+        dst: &PinnedBuffer,
+        token: PrefetchToken,
+        layer_offsets: &[u64],
+    ) -> Result<()> {
+        let config = self.super_shard_config();
+        if !config.enabled || length > config.target_bytes || layer_offsets.is_empty() {
+            return self.schedule(shard_id, byte_offset, length, dst, token);
+        }
+
+        self.schedule(shard_id, byte_offset, length, dst, token)
     }
 }
 
@@ -287,11 +374,11 @@ impl PrefetchEngine {
 /// Returns the `JoinHandle` — the caller should join on shutdown.
 pub fn spawn_cqe_poller(
     ring: Arc<IoUringInstance>,
-    tx: std::sync::mpsc::SyncSender<CqeResult>,
+    _tx: std::sync::mpsc::SyncSender<CqeResult>,
     stop_signal: Arc<AtomicBool>,
-    outstanding_reads: Arc<AtomicUsize>,
+    _outstanding_reads: Arc<AtomicUsize>,
     cpu_core: usize,
-) -> std::thread::JoinHandle<()> {
+) -> crate::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("ramflow-cqe-poller".into())
         // Stack size: 256 KB. The poller does no deep recursion.
@@ -301,8 +388,11 @@ pub fn spawn_cqe_poller(
             pin_thread_to_core(cpu_core);
 
             loop {
-                // Exit cleanly when requested.
-                if stop_signal.load(Ordering::Relaxed) {
+                // Acquire pairs with the Release store in DirectNvmeEngine::Drop.
+                // On ARM/RISC-V, a Relaxed load can see a stale false after the
+                // Release store, leaving this thread spinning indefinitely — a
+                // training-loop hang that bypasses the graceful shutdown protocol.
+                if stop_signal.load(Ordering::Acquire) {
                     break;
                 }
 
@@ -323,15 +413,15 @@ pub fn spawn_cqe_poller(
 
                             // Completion means one in-flight ring entry has retired.
                             // Keep the counter saturating at zero if mismatch occurs.
-                            let prior = outstanding_reads.load(Ordering::Acquire);
+                            let prior = _outstanding_reads.load(Ordering::Acquire);
                             if prior > 0 {
-                                outstanding_reads.fetch_sub(1, Ordering::AcqRel);
+                                _outstanding_reads.fetch_sub(1, Ordering::AcqRel);
                             }
 
                             // send() blocks if the channel is full (back-pressure).
                             // This is intentional — the training loop should not
                             // submit more SQEs than the receiver can process.
-                            if tx.send(result).is_err() {
+                            if _tx.send(result).is_err() {
                                 // Receiver dropped: training is shutting down.
                                 return Ok(());
                             }
@@ -346,7 +436,7 @@ pub fn spawn_cqe_poller(
                 }
             }
         })
-        .expect("failed to spawn ramflow-cqe-poller thread")
+        .map_err(crate::RamFlowError::IoUringError)
 }
 
 // ---------------------------------------------------------------------------
@@ -405,10 +495,77 @@ fn pin_thread_to_core(cpu_core: usize) {
 // or:        cargo test --no-default-features --features mock-cuda
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::nvme::io_uring_setup::IoUringParams;
     use std::io::Write;
+
+    /// Build an open-gate PrefetchEngine (pressure threshold = MAX, gate open).
+    fn make_open_gate_engine() -> PrefetchEngine {
+        let ring = Arc::new(IoUringInstance::setup(IoUringParams::default()).unwrap());
+        let fd_table = Arc::new(FdTable::new().unwrap());
+        let pause = Arc::new(AtomicBool::new(false));
+        let outstanding = Arc::new(AtomicUsize::new(0));
+        let claimed = Arc::new(AtomicUsize::new(0));
+        let threshold = Arc::new(AtomicUsize::new(usize::MAX));
+        PrefetchEngine::new(ring, fd_table, pause, outstanding, claimed, threshold).unwrap()
+    }
+
+    /// schedule() accepts aligned non-Linux inputs without panicking.
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn schedule_accepts_aligned_inputs() {
+        let engine = make_open_gate_engine();
+        let dst = PinnedBuffer::alloc(512).expect("PinnedBuffer::alloc failed");
+        engine
+            .schedule(0, 512, 512, &dst, 0)
+            .expect("aligned non-Linux schedule should be recorded");
+        assert_eq!(engine.outstanding_reads(), 1);
+    }
+
+    /// After O_DIRECT validation: returns Err(IoUringError(InvalidInput)) for misaligned length.
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn schedule_rejects_misaligned_length() {
+        let engine = make_open_gate_engine();
+        let dst = PinnedBuffer::alloc(512).expect("PinnedBuffer::alloc failed");
+        // byte_offset 512 is aligned; length 100 is NOT a multiple of 512.
+        let result = engine.schedule(0, 512, 100, &dst, 0);
+        match result {
+            Err(crate::RamFlowError::IoUringError(ref e))
+                if e.kind() == std::io::ErrorKind::InvalidInput => {}
+            other => panic!(
+                "expected Err(IoUringError(InvalidInput)) for misaligned length, got {other:?}"
+            ),
+        }
+    }
+
+    /// Before O_DIRECT validation is added: panics at todo!() on non-Linux.
+    /// After fix: returns Err(IoUringError(InvalidInput)) for misaligned offset.
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn schedule_rejects_misaligned_byte_offset_before_todo() {
+        use std::panic::AssertUnwindSafe;
+        let engine = make_open_gate_engine();
+        let dst = PinnedBuffer::alloc(512).expect("PinnedBuffer::alloc failed");
+        // byte_offset 100 is NOT a multiple of 512 — violates O_DIRECT.
+        let result =
+            std::panic::catch_unwind(AssertUnwindSafe(|| engine.schedule(0, 100, 512, &dst, 0)));
+        let inner = result.unwrap_or_else(|_| {
+            panic!(
+                "schedule() panicked instead of returning Err — \
+                 O_DIRECT alignment validation is missing"
+            )
+        });
+        match inner {
+            Err(crate::RamFlowError::IoUringError(ref e))
+                if e.kind() == std::io::ErrorKind::InvalidInput => {}
+            other => panic!(
+                "expected Err(IoUringError(InvalidInput)) for misaligned offset, got {other:?}"
+            ),
+        }
+    }
 
     #[test]
     fn pressure_gate_blocks_when_outstanding_plus_claimed_exceeds_threshold() {

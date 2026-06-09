@@ -84,7 +84,7 @@ fn open_shard_file(path: &Path) -> Result<OwnedFd> {
     let file = OpenOptions::new()
         .read(true)
         .open(path)
-        .map_err(|e| RamFlowError::IoUringError(e))?;
+        .map_err(RamFlowError::IoUringError)?;
 
     Ok(unsafe { OwnedFd::from_raw_fd(file.into_raw_fd()) })
 }
@@ -106,6 +106,7 @@ fn open_shard_file(_path: &Path) -> Result<OwnedFd> {
 ///
 /// The key is the shard ID (a u32 matching TensorInfo::shard_id).
 /// OwnedFd calls close(2) on each fd when FdTable is dropped.
+#[derive(Default)]
 pub struct FdTable {
     /// Map from shard_id → owned file descriptor.
     #[cfg(unix)]
@@ -132,13 +133,14 @@ impl FdTable {
     ///
     /// # Errors
     /// Returns `RamFlowError::IoUringError` if the file cannot be opened.
-    pub fn register(&mut self, shard_id: u32, path: &Path) -> Result<()> {
-        let fd = open_shard_file(path)?;
-
+    pub fn register(&mut self, _shard_id: u32, path: &Path) -> Result<()> {
         #[cfg(unix)]
         {
-            self.fds.insert(shard_id, fd);
+            let fd = open_shard_file(path)?;
+            self.fds.insert(_shard_id, fd);
         }
+        #[cfg(not(unix))]
+        open_shard_file(path)?;
 
         self.count += 1;
         Ok(())
@@ -168,6 +170,7 @@ impl FdTable {
     }
 
     #[cfg(not(unix))]
+    /// Returns `None` on non-Unix platforms where file descriptors are not used.
     pub fn get_raw_fd(&self, _shard_id: u32) -> Option<i32> {
         None
     }
@@ -197,17 +200,16 @@ impl FdTable {
     }
 
     #[cfg(not(unix))]
+    /// Clears the shard count on non-Unix platforms (no file descriptors to close).
+    ///
+    /// # Errors
+    /// Never errors on non-Unix.
     pub fn close_all(&mut self) -> Result<()> {
         self.count = 0;
         Ok(())
     }
 }
 
-impl Default for FdTable {
-    fn default() -> Self {
-        Self::new().expect("FdTable::new is infallible")
-    }
-}
 
 // Drop implementation: OwnedFd's own Drop calls close(2) for each fd.
 // Nothing additional is needed here — the compiler-generated Drop for
@@ -225,6 +227,7 @@ impl Drop for FdTable {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::io::Write;

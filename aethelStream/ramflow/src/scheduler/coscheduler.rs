@@ -1,11 +1,30 @@
-// src/scheduler/coscheduler.rs — co-scheduler + per-layer overflow density
+// src/scheduler/coscheduler.rs — CoScheduler + PerLayerScaleTable
 //
-// Sprint 0: all types declared, all logic unimplemented!.
+// Sprint 4: full implementation replacing Sprint 0 stub.
 //
-// Two distinct responsibilities live here:
-//   1. CoScheduler — orchestrates evictions / prefetch based on pressure gauge
-//   2. PerLayerScaleTable — per-layer EWA overflow density + loss scale (Alg 6)
-//      (Idea 1 extension: gradient_variance per layer for precision scheduling)
+// ─── CoScheduler ─────────────────────────────────────────────────────────────
+// Registers two callbacks on MemoryPressureGauge at construction:
+//   High (>0.80): prefetch_window -= 1; pause_signal.store(true, Release)
+//   Low  (<0.40): prefetch_window += 1; pause_signal.store(false, Release)
+//
+// pause_signal is also readable by DirectNvmeEngine (PressurePause error path).
+//
+// ─── PerLayerScaleTable (Algorithm 6) ────────────────────────────────────────
+// EWA overflow density per layer (alpha = 0.05, ~20-step window).
+// Thresholds are configurable struct fields (not compile-time constants) so
+// hardware_profile.json can override them:
+//   density > overflow_high_threshold (default 0.001): halve scale, floor 1.0
+//   density < overflow_low_threshold  (default 0.0001) AND scale < 65536:
+//                                                        double scale, cap 65536
+//
+// BF16 short-circuit: if bf16_mode is true all scales are fixed at 1.0
+// (Ampere+ hardware has native overflow immunity for BF16).
+
+use std::collections::BTreeMap;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+use std::sync::{Arc, Mutex};
 
 use crate::scheduler::pressure_gauge::MemoryPressureGauge;
 
@@ -13,82 +32,170 @@ use crate::scheduler::pressure_gauge::MemoryPressureGauge;
 // PerLayerScaleTable — Algorithm 6
 // ---------------------------------------------------------------------------
 
-/// Per-layer exponentially weighted overflow density tracker and loss scaler.
+/// Per-layer EWA overflow density tracker and loss scaler.
 ///
-/// Maintains, for each transformer layer:
-///   - `density[i]`  EWA of the overflow fraction (overflowed_elements / total)
-///   - `scale[i]`    current per-layer loss scale (init: 65536.0)
-///   - `variance[i]` running mean of gradient magnitude (Idea 1 extension)
+/// For each transformer layer tracks:
+/// - `density[i]`  EWA of overflow fraction (overflowed / total elements)
+/// - `scale[i]`    current per-layer loss scale (initial: 65536.0)
+/// - `gradient_variance[i]`  running mean of gradient magnitude (Idea 1 signal
+///   for INT4 ↔ FP16 precision switching read by Module 3)
+/// - `resident[i]`  hot-set caching flag (Module 3 reads for prefetch priority)
 ///
-/// The EWA decay `alpha` defaults to 0.05 (≈ 20-step window).
-/// Thresholds:
-///   - density > 0.001 (>0.1% elements)  → halve scale for this layer only
-///   - density < 0.0001 (<0.01% elements) → double scale for this layer only
-///
-/// # Sprint 0 contract
-/// Compiles; all methods `unimplemented!`.
+/// Alpha defaults to 0.05 (≈ 20-step smoothing window).
+/// Thresholds are configurable struct fields read from hardware_profile.json.
 pub struct PerLayerScaleTable {
-    /// EWA of overflow fraction per layer.  Length == number of layers.
-    _density: Vec<f32>,
-    /// Current per-layer loss scale.
-    _scale: Vec<f32>,
-    /// Running mean of gradient magnitude per layer (Idea 1 signal).
-    _gradient_variance: Vec<f32>,
-    /// EWA decay constant (default 0.05 → ~20-step smoothing window).
-    _alpha: f32,
+    /// EWA of overflow fraction per layer.
+    density: Vec<f32>,
+
+    /// Current per-layer loss scale (init 65536.0, floor 1.0, cap 65536.0).
+    scale: Vec<f32>,
+
+    /// Running mean of gradient magnitude per layer (Idea 1 signal for Module 3).
+    gradient_variance: Vec<f32>,
+
+    /// Hot-set caching flags — true means Module 3 should keep this layer resident.
+    resident: Vec<bool>,
+
+    /// EWA decay constant (default 0.05 ≈ 20-step window).
+    alpha: f32,
+
+    /// Overflow fraction above which scale is halved.  Default 0.001 (0.1%).
+    overflow_high_threshold: f32,
+
+    /// Overflow fraction below which scale is doubled.  Default 0.0001 (0.01%).
+    overflow_low_threshold: f32,
+
+    /// When true (Ampere+ with BF16 mode active), skip overflow scaling entirely
+    /// and fix all scales at 1.0 — BF16 has native NaN/Inf immunity.
+    bf16_mode: bool,
 }
 
 impl PerLayerScaleTable {
     /// Create a table for a model with `num_layers` layers.
     ///
-    /// All scales are initialised to `65536.0` (standard FP16 maximum scale).
-    /// All densities and variances are initialised to `0.0`.
-    #[allow(unused_variables)]
+    /// All scales initialised to `65536.0`.  All densities and variances to `0.0`.
+    /// Uses default thresholds (0.001 high / 0.0001 low).
     pub fn new(num_layers: usize, alpha: f32) -> Self {
-        unimplemented!("PerLayerScaleTable::new — Sprint 0 stub")
+        Self::with_thresholds(num_layers, alpha, 0.001, 0.0001)
+    }
+
+    /// Create with explicit overflow thresholds read from hardware_profile.json.
+    ///
+    /// `overflow_high_threshold` — fraction above which scale is halved.
+    /// `overflow_low_threshold`  — fraction below which scale is doubled.
+    pub fn with_thresholds(
+        num_layers: usize,
+        alpha: f32,
+        overflow_high_threshold: f32,
+        overflow_low_threshold: f32,
+    ) -> Self {
+        PerLayerScaleTable {
+            density: vec![0.0; num_layers],
+            scale: vec![65536.0; num_layers],
+            gradient_variance: vec![0.0; num_layers],
+            resident: vec![false; num_layers],
+            alpha,
+            overflow_high_threshold,
+            overflow_low_threshold,
+            bf16_mode: false,
+        }
+    }
+
+    /// Enable BF16 short-circuit: fixes all scales at 1.0, skips overflow math.
+    ///
+    /// Call this when the target GPU is Ampere+ and BF16 mode is active.
+    pub fn enable_bf16_mode(&mut self) {
+        self.bf16_mode = true;
+        for scale_entry in &mut self.scale {
+            *scale_entry = 1.0;
+        }
     }
 
     /// Update EWA density and adjust scale for `layer_idx`.
     ///
-    /// `n_total` — total number of FP16 elements in the gradient tensor.
-    /// `n_overflow` — number of NaN/Inf elements counted by the CUDA kernel.
+    /// Only `layer_idx`'s density and scale change; all other layers are untouched.
     ///
-    /// Only `layer_idx`'s scale changes; all other layers are unaffected.
-    #[allow(unused_variables)]
+    /// `n_total` — total FP16 elements in the gradient tensor.
+    /// `n_overflow` — NaN/Inf elements counted by `count_overflow_fp16` kernel.
     pub fn update(&mut self, layer_idx: usize, n_total: usize, n_overflow: u32) {
-        unimplemented!("PerLayerScaleTable::update — Sprint 0 stub")
+        if layer_idx >= self.density.len() {
+            return;
+        }
+        if n_total == 0 {
+            return;
+        }
+        if self.bf16_mode {
+            return;
+        }
+
+        let fraction = n_overflow as f32 / n_total as f32;
+        let new_density =
+            self.alpha * fraction + (1.0 - self.alpha) * self.density[layer_idx];
+        self.density[layer_idx] = new_density;
+
+        if new_density > self.overflow_high_threshold {
+            self.scale[layer_idx] = (self.scale[layer_idx] * 0.5).max(1.0);
+        } else if new_density < self.overflow_low_threshold
+            && self.scale[layer_idx] < 65536.0
+        {
+            self.scale[layer_idx] = (self.scale[layer_idx] * 2.0).min(65536.0);
+        }
     }
 
     /// Current loss scale for `layer_idx`.
-    #[allow(unused_variables)]
+    ///
+    /// Returns 1.0 for all layers when `bf16_mode` is active.
     pub fn get_scale(&self, layer_idx: usize) -> f32 {
-        unimplemented!("PerLayerScaleTable::get_scale — Sprint 0 stub")
+        if self.bf16_mode {
+            return 1.0;
+        }
+        self.scale.get(layer_idx).copied().unwrap_or(1.0)
     }
 
-    /// Current overflow density EWA for `layer_idx`.
-    #[allow(unused_variables)]
+    /// Current EWA overflow density for `layer_idx`.
     pub fn get_density(&self, layer_idx: usize) -> f32 {
-        unimplemented!("PerLayerScaleTable::get_density — Sprint 0 stub")
+        self.density.get(layer_idx).copied().unwrap_or(0.0)
     }
 
     /// Update the gradient variance estimate for `layer_idx` (Idea 1 signal).
     ///
-    /// Module 3 reads this to decide whether to stream a layer in INT4 or FP16.
-    #[allow(unused_variables)]
+    /// Module 3 reads this to decide INT4 vs FP16 streaming precision per layer.
     pub fn update_gradient_variance(&mut self, layer_idx: usize, grad_mean_sq: f32) {
-        unimplemented!("PerLayerScaleTable::update_gradient_variance — Sprint 0 stub")
+        if layer_idx < self.gradient_variance.len() {
+            self.gradient_variance[layer_idx] = grad_mean_sq;
+        }
     }
 
     /// Gradient variance for `layer_idx` (for Module 3's precision scheduler).
-    #[allow(unused_variables)]
     pub fn gradient_variance(&self, layer_idx: usize) -> f32 {
-        unimplemented!("PerLayerScaleTable::gradient_variance — Sprint 0 stub")
+        self.gradient_variance.get(layer_idx).copied().unwrap_or(0.0)
     }
 
-    /// Reset all per-layer scales to `65536.0` (fired by the parity guard
-    /// every 500 steps to prevent numerical drift from compounding).
+    /// Mark or unmark `layer_idx` as hot-set resident.
+    ///
+    /// Module 3 reads this flag to decide prefetch priority: resident layers
+    /// are kept in RAM between forward and backward passes.
+    pub fn mark_resident(&mut self, layer_idx: usize, resident: bool) {
+        if layer_idx < self.resident.len() {
+            self.resident[layer_idx] = resident;
+        }
+    }
+
+    /// Whether `layer_idx` is currently marked hot-set resident.
+    pub fn is_resident(&self, layer_idx: usize) -> bool {
+        self.resident.get(layer_idx).copied().unwrap_or(false)
+    }
+
+    /// Reset all scales to `65536.0`.
+    ///
+    /// Called by the parity guard every 500 steps to prevent drift accumulation.
     pub fn reset_all_scales(&mut self) {
-        unimplemented!("PerLayerScaleTable::reset_all_scales — Sprint 0 stub")
+        if self.bf16_mode {
+            return;
+        }
+        for scale_entry in &mut self.scale {
+            *scale_entry = 65536.0;
+        }
     }
 }
 
@@ -96,47 +203,136 @@ impl PerLayerScaleTable {
 // CoScheduler
 // ---------------------------------------------------------------------------
 
-/// Orchestrates tensor evictions and prefetches based on [`MemoryPressureGauge`]
-/// signals and phase-transition hints from the profiler.
+/// Orchestrates tensor evictions and prefetch control based on
+/// `MemoryPressureGauge` signals.
 ///
-/// Wired to the NVMe engine's `pause_signal` atomic — when pressure exceeds
-/// the high threshold, the co-scheduler sets `pause_signal = true`, causing
-/// the next `DirectNvmeEngine::prefetch` call to return
-/// `Err(PressurePause)` immediately.
+/// At construction, registers two callbacks on the shared `GaugeInner`:
+/// - **High** (> 0.80): decrement `prefetch_window`; set `pause_signal = true`.
+/// - **Low**  (< 0.40): increment `prefetch_window`; set `pause_signal = false`.
 ///
-/// # Sprint 0 contract
-/// Compiles; all methods `unimplemented!`.
+/// `pause_signal` is read by `DirectNvmeEngine::prefetch` to emit
+/// `Err(PressurePause)` when pressure is high.
 pub struct CoScheduler {
-    _gauge: (),
+    /// Gauge whose callbacks were registered at construction.
+    gauge: MemoryPressureGauge,
+
+    /// Current prefetch window size.  Shared with the registered callbacks via Arc.
+    /// Initial value: 2.  Decremented on high pressure; incremented on low pressure.
+    prefetch_window: Arc<AtomicI32>,
+
+    /// Set true by the high-pressure callback; cleared by the low-pressure callback.
+    /// Read by DirectNvmeEngine to emit PressurePause.
+    pause_signal: Arc<AtomicBool>,
+
+    /// Set true by the soft-pressure callback (0.70–0.80); cleared by low-pressure.
+    ///
+    /// Module 5 reads this via should_compress_checkpoints() to decide whether
+    /// to compress activation checkpoints to INT8 before the next layer streams in.
+    compress_trigger: Arc<AtomicBool>,
+
+    /// Registered tensors: tensor_id → eviction priority (lower = evict first).
+    tensor_registry: Mutex<BTreeMap<u64, u8>>,
 }
 
 impl CoScheduler {
-    /// Construct a co-scheduler backed by `gauge`.
+    /// Construct a co-scheduler and register pressure callbacks on `gauge`.
     ///
-    /// Registers two callbacks on the gauge at construction time:
-    ///   - High pressure (> 0.8): decrement prefetch window; set pause_signal.
-    ///   - Low pressure  (< 0.4): increment prefetch window; clear pause_signal.
-    #[allow(unused_variables)]
+    /// Both `prefetch_window` and `pause_signal` are `Arc`-shared with the
+    /// closures so the callbacks mutate the same atomics that `is_paused()` and
+    /// `prefetch_window()` read.
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible.  Returns `Result` so callers can handle future
+    /// resource-allocation failures (e.g., NVMe engine registration) without
+    /// an API break.
     pub fn new(gauge: MemoryPressureGauge) -> crate::Result<Self> {
-        unimplemented!("CoScheduler::new — Sprint 0 stub")
+        let prefetch_window = Arc::new(AtomicI32::new(2));
+        let pause_signal = Arc::new(AtomicBool::new(false));
+        let compress_trigger = Arc::new(AtomicBool::new(false));
+
+        // High-pressure callback (> 0.80) — shrink window, pause prefetch.
+        // AcqRel on fetch_sub: makes prior writes in this thread visible to
+        // the next thread that observes the decremented window.
+        let window_high = Arc::clone(&prefetch_window);
+        let pause_high = Arc::clone(&pause_signal);
+        gauge.register_high_pressure(move |_pressure| {
+            window_high.fetch_sub(1, AcqRel);
+            pause_high.store(true, Release);
+        });
+
+        // Soft-pressure callback (0.70 < p <= 0.80) — trigger INT8 checkpoint
+        // compression before the hard stop activates.  Module 5 reads
+        // should_compress_checkpoints() on each backward step.
+        let compress_soft = Arc::clone(&compress_trigger);
+        gauge.register_soft_pressure(move |_pressure| {
+            compress_soft.store(true, Release);
+        });
+
+        // Low-pressure callback (< 0.40) — resume prefetch and clear compression.
+        let window_low = Arc::clone(&prefetch_window);
+        let pause_low = Arc::clone(&pause_signal);
+        let compress_low = Arc::clone(&compress_trigger);
+        gauge.register_low_pressure(move |_pressure| {
+            window_low.fetch_add(1, AcqRel);
+            pause_low.store(false, Release);
+            // Clear compression trigger once pressure fully recovers.
+            compress_low.store(false, Release);
+        });
+
+        Ok(CoScheduler {
+            gauge,
+            prefetch_window,
+            pause_signal,
+            compress_trigger,
+            tensor_registry: Mutex::new(BTreeMap::new()),
+        })
     }
 
-    /// Run one scheduling tick — evict cold tensors, trigger prefetches.
-    pub fn tick(&self) -> crate::Result<()> {
-        unimplemented!("CoScheduler::tick — Sprint 0 stub")
-    }
-
-    /// Register a tensor with `id` that may be evicted when pressure is high.
+    /// Run one scheduling tick — evict cold tensors, allow prefetch to resume.
     ///
-    /// `priority` — lower is more evictable (0 = evict first, 255 = pin last).
-    #[allow(unused_variables)]
-    pub fn register_tensor(&self, tensor_id: u64, priority: u8) {
-        unimplemented!("CoScheduler::register_tensor — Sprint 0 stub")
+    /// In Sprint 4 the tick is driven entirely by pressure callbacks; this method
+    /// is reserved for future proactive eviction based on age metadata.
+    pub fn tick(&self) -> crate::Result<()> {
+        Ok(())
     }
 
-    /// Deregister a tensor (e.g. when it is freed or permanently evicted).
-    #[allow(unused_variables)]
+    /// Register a tensor for eviction eligibility.
+    ///
+    /// `priority` — lower is more evictable (0 = evict first, 255 = keep last).
+    pub fn register_tensor(&self, tensor_id: u64, priority: u8) {
+        self.tensor_registry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(tensor_id, priority);
+    }
+
+    /// Deregister a tensor (freed or permanently evicted).
     pub fn deregister_tensor(&self, tensor_id: u64) {
-        unimplemented!("CoScheduler::deregister_tensor — Sprint 0 stub")
+        self.tensor_registry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&tensor_id);
+    }
+
+    /// Whether the NVMe prefetch engine is currently paused due to high pressure.
+    pub fn is_paused(&self) -> bool {
+        self.pause_signal.load(Acquire)
+    }
+
+    /// Current prefetch window size.
+    ///
+    /// Can go negative (fully stopped) when multiple high-pressure events fire
+    /// before a low-pressure event restores it.  `DirectNvmeEngine` treats any
+    /// value ≤ 0 as "do not prefetch" (redundantly with `pause_signal`).
+    pub fn prefetch_window(&self) -> i32 {
+        self.prefetch_window.load(Acquire)
+    }
+
+    /// Reference to the underlying pressure gauge.
+    ///
+    /// Module 3 uses this to call `sample_and_notify` from the training loop.
+    pub fn gauge(&self) -> &MemoryPressureGauge {
+        &self.gauge
     }
 }

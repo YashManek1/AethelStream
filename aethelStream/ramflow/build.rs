@@ -1,4 +1,6 @@
 //! build.rs — ramflow CUDA detection and kernel compilation
+// Build scripts legitimately use panic!/expect() to signal fatal build failures.
+#![allow(clippy::panic, clippy::expect_used)]
 //!
 //! Sprint 2 update: compiles overflow_check.cu alongside stub.cu.
 //! Both .o files are archived into libramflow_cuda_stub.a.
@@ -26,6 +28,9 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/overflow_check.cu");
     println!("cargo:rerun-if-changed=kernels/overflow_check.cuh");
     println!("cargo:rerun-if-changed=kernels/overflow_density.cu");
+    println!("cargo:rerun-if-changed=kernels/overflow_density.cuh");
+    println!("cargo:rerun-if-changed=kernels/checkpoint_compress.cu");
+    println!("cargo:rerun-if-changed=kernels/checkpoint_compress.cuh");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=NVCC");
@@ -97,8 +102,8 @@ fn main() {
     let cu_sources: &[(&str, &str)] = &[
         ("kernels/stub.cu", "stub.o"),
         ("kernels/overflow_check.cu", "overflow_check.o"),
-        // overflow_density.cu is Sprint 4; uncomment then:
-        // ("kernels/overflow_density.cu", "overflow_density.o"),
+        ("kernels/overflow_density.cu", "overflow_density.o"),
+        ("kernels/checkpoint_compress.cu", "checkpoint_compress.o"),
     ];
 
     let mut obj_files: Vec<PathBuf> = Vec::new();
@@ -107,9 +112,7 @@ fn main() {
         let cu_file = PathBuf::from(src);
         let obj_file = out_dir.join(obj_name);
 
-        // Skip missing files gracefully (e.g., overflow_density.cu is a stub
-        // with no real kernel yet — it has a placeholder symbol and compiles,
-        // but we don't need to force-compile it until Sprint 4).
+        // Skip missing files gracefully (build environments without nvcc).
         if !cu_file.exists() {
             eprintln!("cargo:warning=Skipping missing CUDA source: {src}");
             continue;
@@ -248,3 +251,5 @@ fn find_cuda_lib_dir() -> Option<PathBuf> {
     }
     None
 }
+
+
