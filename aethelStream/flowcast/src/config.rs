@@ -1,0 +1,156 @@
+//! FlowCast configuration types.
+//!
+//! `FlowCastConfig` is the single input to `FlowCast::new`.
+//! `HardwareProfile` holds measured timing; it is written to disk after the
+//! warm-up profiler completes and loaded on subsequent runs.
+
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Streaming precision mode for a layer slot.
+///
+/// FlowCast selects the mode per-layer based on importance scores (A8).
+/// INT4/INT8 apply to weights in the middle of the network; FP16 is used
+/// for edge layers where numerical sensitivity is high.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Precision {
+    /// Full precision (FP32) — only used during warm-up profiling.
+    FP32,
+    /// Half precision (FP16) — edge layers and activations.
+    FP16,
+    /// Brain floating-point (BF16) — preferred on Ampere/Ada.
+    BF16,
+    /// 8-bit integer — mid-network weights after calibration.
+    INT8,
+    /// 4-bit integer — highest compression, mid-network only.
+    INT4,
+}
+
+/// Per-layer timing record produced by the warm-up profiler.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayerTiming {
+    /// Layer index (matches `shard_index.json`).
+    pub layer_idx: u32,
+
+    /// Measured forward-pass GPU kernel time (milliseconds).
+    pub forward_ms: f32,
+
+    /// Measured backward-pass GPU kernel time (milliseconds).
+    pub backward_ms: f32,
+
+    /// Byte size of the layer shard (weights + optional adapter).
+    pub shard_bytes: u64,
+
+    /// Estimated NVMe → RAM transfer time at measured bandwidth (milliseconds).
+    pub transfer_ms: f32,
+}
+
+/// Hardware-profile produced by the warm-up profiler and cached to disk.
+///
+/// Written to `<shard_dir>/hardware_profile.json` after the first warm-up.
+/// All time values are exponentially weighted averages over
+/// `HardwareProfile::sample_count` steps.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HardwareProfile {
+    // ---- bandwidth section ----
+    /// Measured NVMe → system-RAM bandwidth (GB/s).
+    pub nvme_bandwidth_gbs: f32,
+
+    /// Measured PCIe host → device bandwidth (GB/s).
+    pub pcie_bandwidth_gbs: f32,
+
+    /// Measured GPU global-memory bandwidth (GB/s).
+    pub gpu_bandwidth_gbs: f32,
+
+    // ---- timing section ----
+    /// Mean forward-pass GPU time averaged across all layers (milliseconds).
+    pub mean_forward_ms: f32,
+
+    /// Mean backward-pass GPU time averaged across all layers (milliseconds).
+    pub mean_backward_ms: f32,
+
+    /// Number of warm-up steps used to produce this profile.
+    pub sample_count: u32,
+
+    // ---- layer_plan section ----
+    /// Per-layer timing breakdown, ordered by `layer_idx`.
+    ///
+    /// The prefetch engine uses this to size the T_iter lookahead window:
+    /// a layer must be fully transferred before its GPU kernel begins.
+    pub layer_plan: Vec<LayerTiming>,
+}
+
+/// Configuration for a FlowCast pipeline instance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowCastConfig {
+    /// Root directory that contains `shard_NNNN.bin` files and `shard_index.json`.
+    pub shard_dir: PathBuf,
+
+    /// Number of shard files (must match the model's layer count).
+    pub num_shards: u32,
+
+    /// Prefetch lookahead depth in layers (initial value; A2 adapts it).
+    pub initial_lookahead: u32,
+
+    /// EWMA alpha for the adaptive window (A2). Range: (0, 1].
+    pub ewma_alpha: f32,
+
+    /// Memory pressure fraction at which prefetch is paused. Range: (0, 1].
+    ///
+    /// Passed to `MemoryPressureGauge::register_high_pressure` via RamFlow.
+    pub pressure_threshold: f32,
+
+    /// Default streaming precision. A8 may override per-layer.
+    pub default_precision: Precision,
+
+    /// Previously measured hardware profile; `None` triggers warm-up profiling.
+    pub hardware_profile: Option<HardwareProfile>,
+
+    /// CPU core for the io_uring CQE poller thread.
+    pub io_poller_cpu_core: usize,
+
+    /// CPU core for the completion-router thread.
+    pub completion_router_cpu_core: usize,
+
+    /// Target GPU utilisation fraction (used by A2 to judge under-prefetching).
+    pub target_gpu_utilisation: f32,
+}
+
+impl Default for FlowCastConfig {
+    fn default() -> Self {
+        Self {
+            shard_dir: PathBuf::from("./shards"),
+            num_shards: 0,
+            initial_lookahead: 2,
+            ewma_alpha: 0.3,
+            pressure_threshold: 0.80,
+            default_precision: Precision::FP16,
+            hardware_profile: None,
+            io_poller_cpu_core: 0,
+            completion_router_cpu_core: 1,
+            target_gpu_utilisation: 0.95,
+        }
+    }
+}
+
+impl FlowCastConfig {
+    /// Validate all fields.  Called inside `FlowCast::new`.
+    pub fn validate(&self) -> crate::Result<()> {
+        if !(0.0 < self.ewma_alpha && self.ewma_alpha <= 1.0) {
+            return Err(crate::FlowCastError::Config(
+                "ewma_alpha must be in (0, 1]".to_string(),
+            ));
+        }
+        if !(0.0 < self.pressure_threshold && self.pressure_threshold <= 1.0) {
+            return Err(crate::FlowCastError::Config(
+                "pressure_threshold must be in (0, 1]".to_string(),
+            ));
+        }
+        if !(0.0 < self.target_gpu_utilisation && self.target_gpu_utilisation <= 1.0) {
+            return Err(crate::FlowCastError::Config(
+                "target_gpu_utilisation must be in (0, 1]".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
