@@ -432,20 +432,24 @@ fn run_integration_body(profile_path: &PathBuf) {
     let mut scale_table = PerLayerScaleTable::new(NUM_SYNTHETIC_LAYERS, 0.05);
 
     for _ in 0..100 {
-        scale_table.update(INFECTED_LAYER, ELEMENTS_PER_LAYER, OVERFLOWED_ELEMENTS);
+        scale_table
+            .update(INFECTED_LAYER, ELEMENTS_PER_LAYER, OVERFLOWED_ELEMENTS)
+            .expect("update INFECTED_LAYER");
     }
 
     // EWA with alpha=0.05 after 100 steps at constant 0.03 overflow fraction:
     // density ≈ 0.03 × (1 − 0.95^100) ≈ 0.0298, within ±10% of 0.030.
-    let infected_density = scale_table.get_density(INFECTED_LAYER);
+    let infected_density = scale_table
+        .get_density(INFECTED_LAYER)
+        .expect("get_density INFECTED_LAYER");
     assert!(
         (infected_density - 0.030_f32).abs() <= 0.003_f32,
         "infected layer {INFECTED_LAYER} density must converge to 0.030 ±10%, got {infected_density:.6}"
     );
     assert!(
-        scale_table.get_scale(INFECTED_LAYER) < 65536.0_f32,
+        scale_table.get_scale(INFECTED_LAYER).expect("get_scale INFECTED_LAYER") < 65536.0_f32,
         "infected layer {INFECTED_LAYER} scale must be reduced from 65536.0 (got {})",
-        scale_table.get_scale(INFECTED_LAYER)
+        scale_table.get_scale(INFECTED_LAYER).expect("get_scale INFECTED_LAYER display")
     );
 
     // Clean layers must be untouched.
@@ -454,16 +458,135 @@ fn run_integration_body(profile_path: &PathBuf) {
             continue;
         }
         assert_eq!(
-            scale_table.get_density(layer_index),
+            scale_table.get_density(layer_index).expect("get_density clean layer"),
             0.0_f32,
             "clean layer {layer_index}: density must be 0.0 (never updated)"
         );
         assert_eq!(
-            scale_table.get_scale(layer_index),
+            scale_table.get_scale(layer_index).expect("get_scale clean layer"),
             65536.0_f32,
             "clean layer {layer_index}: scale must remain at 65536.0 (never updated)"
         );
     }
 
     // co, gauge, registry, classifier, rebalancer, scale_table all drop here.
+}
+
+// ---------------------------------------------------------------------------
+// FIX M2-1b: VmRSS lower-bound check for pinned 1 MiB allocation
+// ---------------------------------------------------------------------------
+
+#[test]
+#[cfg(target_os = "linux")]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+fn pinned_alloc_vmrss_grows_by_approximately_requested_size() {
+    fn read_vmrss_kb() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                return rest.trim().split_whitespace().next()
+                    .and_then(|s| s.parse::<u64>().ok());
+            }
+        }
+        None
+    }
+    let before = read_vmrss_kb().unwrap_or(0);
+    if before == 0 { return; } // non-Linux environment
+    let _buf = ramflow::PinnedBuffer::alloc(1024 * 1024).expect("alloc 1 MiB");
+    let after = read_vmrss_kb().unwrap_or(0);
+    let growth_kb = after.saturating_sub(before);
+    // Must grow by at least 256 KiB (allowing for concurrent allocations reducing apparent growth)
+    // and at most 4 MiB (page overhead + CUDA registration metadata).
+    assert!(
+        growth_kb >= 256,
+        "VmRSS grew by only {growth_kb} KiB after 1 MiB alloc — pinned pages not committed"
+    );
+    assert!(
+        growth_kb <= 4 * 1024,
+        "VmRSS grew by {growth_kb} KiB after 1 MiB alloc — unexpected RSS spike"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FIX M2-2e: WarmupProfiler SHA-256 validity and second-run cache hit
+// ---------------------------------------------------------------------------
+
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+fn warmup_profiler_sha256_nonzero_and_second_run_uses_cache() {
+    use ramflow::phase::{WarmupConfig, WarmupProfiler};
+
+    // ── 1. Create a temp dir and write a minimal shard_index.json ────────────
+    let tmp_dir = make_temp_dir("profiler_sha256");
+    let shard_index_path = tmp_dir.join("shard_index.json");
+    let profile_path = tmp_dir.join("hardware_profile.json");
+
+    std::fs::write(
+        &shard_index_path,
+        br#"{"layers":[],"version":1}"#,
+    )
+    .expect("write shard_index.json");
+
+    // ── 2. WarmupConfig::for_shard_index computes a non-zero SHA-256 ─────────
+    let config = WarmupConfig::for_shard_index(3, profile_path.clone(), &shard_index_path)
+        .expect("WarmupConfig::for_shard_index");
+
+    assert_ne!(
+        config.model_sha256,
+        [0u8; 32],
+        "SHA-256 of a non-empty shard_index.json must not be all-zeros"
+    );
+
+    // ── 3. First run: hardware_profile.json must not exist beforehand, ────────
+    //       and must be written by run().
+    assert!(
+        !profile_path.exists(),
+        "hardware_profile.json must not exist before first profiler run"
+    );
+
+    let profiler_first = WarmupProfiler::new(config.clone()).expect("WarmupProfiler::new (first)");
+    let profiles_first = profiler_first.run().expect("WarmupProfiler::run (first)");
+
+    assert!(
+        profile_path.exists(),
+        "hardware_profile.json must be written after the first WarmupProfiler::run"
+    );
+
+    // ── 4. Second run: cache hit — must return identical profiles without ──────
+    //       re-running simulate_mini_step (counters on a fresh profiler stay at
+    //       default and the cached file is loaded directly).
+    let profiler_second = WarmupProfiler::new(config.clone()).expect("WarmupProfiler::new (second)");
+
+    // The second profiler's cache is valid because the profile file now exists
+    // and its embedded SHA-256 matches config.model_sha256.
+    assert!(
+        profiler_second.is_cache_valid(),
+        "second WarmupProfiler must report a valid cache after first run wrote the profile"
+    );
+
+    let profiles_second = profiler_second.run().expect("WarmupProfiler::run (second)");
+
+    // Profiles must be identical — the second run reads from cache, no measurement.
+    assert_eq!(
+        profiles_first[0].attention_slots_needed,
+        profiles_second[0].attention_slots_needed,
+        "forward attention_slots_needed must match between run 1 and run 2"
+    );
+    assert_eq!(
+        profiles_first[1].attention_slots_needed,
+        profiles_second[1].attention_slots_needed,
+        "backward attention_slots_needed must match between run 1 and run 2"
+    );
+    assert_eq!(
+        profiles_first[2].attention_slots_needed,
+        profiles_second[2].attention_slots_needed,
+        "recomputation attention_slots_needed must match between run 1 and run 2"
+    );
+    assert_eq!(
+        profiles_first[0].mlp_slots_needed,
+        profiles_second[0].mlp_slots_needed,
+        "forward mlp_slots_needed must match between run 1 and run 2"
+    );
+
+    remove_temp_dir(&tmp_dir);
 }

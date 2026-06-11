@@ -7,6 +7,8 @@
 //! Resident layers are registered in `PerLayerScaleTable::mark_resident` so
 //! `PrefetchStateMachine` can skip I/O for them (they are already in RAM).
 
+use std::cmp::Reverse;
+
 use ramflow::PerLayerScaleTable;
 
 // ---------------------------------------------------------------------------
@@ -99,7 +101,7 @@ impl HotSet {
             if self.entries.len() >= self.capacity {
                 break;
             }
-            if !self.is_resident(layer_idx) {
+            if !scale_table.is_resident(layer_idx as usize) {
                 self.entries.push(Entry { layer_idx, access_count: 0 });
                 scale_table.mark_resident(layer_idx as usize, true);
             }
@@ -165,21 +167,28 @@ impl HotSet {
     // Query
     // ------------------------------------------------------------------
 
-    /// Whether `layer_idx` is currently in the hot-set (resident in RAM).
-    pub fn is_resident(&self, layer_idx: u32) -> bool {
-        self.entries.iter().any(|e| e.layer_idx == layer_idx)
+    /// Whether `layer_idx` is currently resident in pinned RAM.
+    ///
+    /// Delegates to `scale_table.is_resident` (A6-c fix: the previous
+    /// implementation read from `self.entries`, which diverged from the
+    /// authoritative residency store in `PerLayerScaleTable`).
+    pub fn is_resident(&self, layer_idx: u32, scale_table: &PerLayerScaleTable) -> bool {
+        scale_table.is_resident(layer_idx as usize)
     }
 
-    /// Resident layer indices, ordered by descending access count.
+    /// Resident layer indices ordered by descending access count.
+    ///
+    /// Uses `self.entries` for the ordering (LFU counts); residency truth is in
+    /// `PerLayerScaleTable` and checked via `is_resident`.
     pub fn resident_layers(&self) -> Vec<u32> {
         let mut sorted = self.entries.clone();
-        sorted.sort_unstable_by(|a, b| b.access_count.cmp(&a.access_count));
+        sorted.sort_unstable_by_key(|entry| Reverse(entry.access_count));
         sorted.iter().map(|e| e.layer_idx).collect()
     }
 
-    /// Whether `layer_idx` is currently in the hot set (alias for `is_resident`).
-    pub fn is_hot(&self, layer_idx: u32) -> bool {
-        self.is_resident(layer_idx)
+    /// Whether `layer_idx` is in the hot-set (delegates to `is_resident`).
+    pub fn is_hot(&self, layer_idx: u32, scale_table: &PerLayerScaleTable) -> bool {
+        self.is_resident(layer_idx, scale_table)
     }
 
     /// Evict the least-frequently-used entry.

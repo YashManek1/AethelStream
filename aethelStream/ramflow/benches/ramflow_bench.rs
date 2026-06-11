@@ -192,7 +192,7 @@ fn bench_ewa_scale_table(c: &mut Criterion) {
     group.bench_function("scale_table_update_one_layer", |b| {
         let mut table = PerLayerScaleTable::new(NUM_LAYERS, 0.05);
         b.iter(|| {
-            table.update(black_box(0), black_box(ELEMENTS), black_box(100u32));
+            let _ = table.update(black_box(0), black_box(ELEMENTS), black_box(100u32));
         });
     });
 
@@ -201,7 +201,7 @@ fn bench_ewa_scale_table(c: &mut Criterion) {
         let mut table = PerLayerScaleTable::new(NUM_LAYERS, 0.05);
         b.iter(|| {
             for layer in 0..NUM_LAYERS {
-                table.update(black_box(layer), black_box(ELEMENTS), black_box(50u32));
+                let _ = table.update(black_box(layer), black_box(ELEMENTS), black_box(50u32));
             }
         });
     });
@@ -211,7 +211,7 @@ fn bench_ewa_scale_table(c: &mut Criterion) {
         let table = PerLayerScaleTable::new(NUM_LAYERS, 0.05);
         b.iter(|| {
             for layer in 0..NUM_LAYERS {
-                black_box(table.get_scale(layer));
+                black_box(table.get_scale(layer).unwrap_or(1.0));
             }
         });
     });

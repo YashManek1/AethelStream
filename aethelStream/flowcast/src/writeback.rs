@@ -18,6 +18,7 @@
 //! feature) before calling `IoBackend::write_async`.
 
 use crate::backend::IoBackend;
+use crate::telemetry::Telemetry;
 use crate::{FlowCastError, Result};
 use ramflow::nvme::write_budget::WriteBudgetManager;
 use ramflow::PinnedBuffer;
@@ -110,6 +111,8 @@ pub struct WritebackScheduler {
     inflight: Arc<AtomicU32>,
     /// Write-budget manager (ssd-wear routing).
     budget: WriteBudgetManager,
+    /// Optional telemetry handle; wired via `set_telemetry` (T-b fix).
+    telemetry: Option<Arc<Telemetry>>,
 }
 
 impl WritebackScheduler {
@@ -133,7 +136,13 @@ impl WritebackScheduler {
             total_in_pass: 0,
             inflight: Arc::new(AtomicU32::new(0)),
             budget,
+            telemetry: None,
         }
+    }
+
+    /// Wire a telemetry handle so write-skip and write-submit events are counted (T-b fix).
+    pub fn set_telemetry(&mut self, telemetry: Arc<Telemetry>) {
+        self.telemetry = Some(telemetry);
     }
 
     // ------------------------------------------------------------------
@@ -175,6 +184,9 @@ impl WritebackScheduler {
 
         if should_skip {
             self.skipped_in_pass += 1;
+            if let Some(telemetry) = &self.telemetry {
+                telemetry.record_write_skip();
+            }
             return Ok(());
         }
 
@@ -189,7 +201,10 @@ impl WritebackScheduler {
             FlowCastError::BackendIo(format!("write budget: {e}"))
         })?;
 
-        // Submit async write.
+        // Submit async write; record telemetry before submission (T-b fix).
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.record_write_submitted();
+        }
         let token = write_token(layer_idx);
         self.inflight.fetch_add(1, Ordering::AcqRel);
         if let Err(error) = backend.write_async(layer_idx, byte_offset, byte_length, src, token) {
@@ -221,13 +236,23 @@ impl WritebackScheduler {
         for layer_idx in layers {
             if let Some(&src) = src_map.get(&layer_idx) {
                 self.accumulated_delta.insert(layer_idx, 0.0);
-                self.wait_for_inflight_slot(backend).ok();
-                self.budget.enqueue_write(layer_idx, src).ok();
+                if let Err(error) = self.wait_for_inflight_slot(backend) {
+                    last_error = Some(error);
+                    continue;
+                }
+                if let Err(error) = self.budget.enqueue_write(layer_idx, src).map_err(|error| {
+                    FlowCastError::BackendIo(format!(
+                        "write budget layer {layer_idx}: {error}"
+                    ))
+                }) {
+                    last_error = Some(error);
+                    continue;
+                }
                 let token = write_token(layer_idx);
                 self.inflight.fetch_add(1, Ordering::AcqRel);
-                if let Err(e) = backend.write_async(layer_idx, 0, src.len() as u64, src, token) {
+                if let Err(error) = backend.write_async(layer_idx, 0, src.len() as u64, src, token) {
                     self.inflight.fetch_sub(1, Ordering::AcqRel);
-                    last_error = Some(e);
+                    last_error = Some(error);
                 }
             }
         }
@@ -281,7 +306,7 @@ impl WritebackScheduler {
         let writes = std::mem::take(&mut self.pending);
         for write in writes {
             let buf = PinnedBuffer::alloc(write.byte_length as usize)
-                .map_err(|e| FlowCastError::RamFlow(e))?;
+                .map_err(FlowCastError::RamFlow)?;
             let token = write_token(write.layer_idx);
             backend.write_async(
                 write.layer_idx,

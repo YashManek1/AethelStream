@@ -73,7 +73,7 @@ pub enum WriteStrategy {
 
 /// Reads the cumulative "Data Units Written" counter from NVMe SMART telemetry.
 ///
-/// Abstracted via a trait so tests can inject a [`MockSmartSource`] instead
+/// Abstracted via a trait so tests can inject a `MockSmartSource` instead
 /// of requiring a real `/dev/nvmeN` device node.
 pub trait SmartSource: Send + Sync {
     /// Return the current "Data Units Written" value (1 unit = 512 000 bytes).

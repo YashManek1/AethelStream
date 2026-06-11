@@ -87,7 +87,86 @@ pub fn count_overflow_fp16(
     }
 }
 
+/// Round x to the nearest integer using IEEE 754 round-to-nearest-even
+/// (ties go to the even integer), matching CUDA's `__float2int_rn`.
+///
+/// `f32::round()` uses round-half-away-from-zero (C `roundf` semantics),
+/// which diverges from `__float2int_rn` on exact half-values (e.g. 2.5).
+/// This helper preserves parity between the mock and the real CUDA kernel.
+fn round_half_to_even(x: f32) -> f32 {
+    let floor = x.floor();
+    let diff = x - floor;
+    // Exact tie: x = n + 0.5 for some integer n.
+    if (diff - 0.5_f32).abs() < f32::EPSILON * 4.0 {
+        // Round toward the even integer.
+        if (floor as i64) % 2 == 0 {
+            floor
+        } else {
+            floor + 1.0
+        }
+    } else {
+        x.round()
+    }
+}
+
+/// Split a packed INT8-compressed checkpoint buffer into its scale and data sub-pointers.
+///
+/// # Packed layout contract
+/// When a [`crate::allocator::PinnedBuffer`] holds an INT8-compressed activation checkpoint
+/// (i.e. `buf.is_compressed() == true`), its bytes are arranged as:
+///
+/// ```text
+/// ┌─────────────────────────────────┬──────────────────────────────────┐
+/// │  n_channels × sizeof(f32)       │  n_channels × elems_per_channel  │
+/// │  per-channel scale factors (f32)│  × sizeof(i8)  quantised values  │
+/// └─────────────────────────────────┴──────────────────────────────────┘
+/// ^─── base ptr (512-byte aligned) ──────────────────────────────────^
+/// ```
+///
+/// This helper computes the two sub-pointers from a single base pointer, matching
+/// the layout assumed by [`compress_checkpoint_fp16_to_int8`] and
+/// [`decompress_checkpoint_int8_to_fp16`] when the caller uses a single buffer.
+///
+/// # Safety
+/// `base` must point to a buffer of at least
+/// `n_channels * size_of::<f32>() + n_channels * elems_per_channel` bytes,
+/// aligned to 512 bytes.
+///
+/// # Returns
+/// `(scales_ptr, data_ptr)` — `scales_ptr` is the start of the buffer cast to
+/// `*mut f32`, and `data_ptr` is offset by `n_channels * 4` bytes cast to `*mut i8`.
+///
+/// # Errors
+/// Returns [`crate::RamFlowError::ConfigError`] if `n_channels` is zero.
+pub unsafe fn split_compressed_buffer_ptrs(
+    base: *mut u8,
+    n_channels: usize,
+) -> crate::Result<(*mut f32, *mut i8)> {
+    if n_channels == 0 {
+        return Err(crate::RamFlowError::ConfigError(
+            "split_compressed_buffer_ptrs: n_channels must be > 0".into(),
+        ));
+    }
+    let scale_bytes = n_channels * core::mem::size_of::<f32>();
+    // SAFETY: base is valid for at least scale_bytes + data bytes (caller guarantee).
+    let scales_ptr = base as *mut f32;
+    let data_ptr = unsafe { base.add(scale_bytes) } as *mut i8;
+    Ok((scales_ptr, data_ptr))
+}
+
 /// Compress FP16 activation checkpoint data to INT8 with one scale per channel.
+///
+/// # Packed buffer convention
+/// Callers that allocate a single [`crate::allocator::PinnedBuffer`] for the compressed
+/// result must place scales at the start of the buffer and INT8 data immediately after:
+/// use [`split_compressed_buffer_ptrs`] to derive `dst_device` and `scales_device` from
+/// the buffer's base pointer.
+///
+/// # After completion
+/// On `Ok(())`, call [`crate::allocator::PinnedBuffer::set_compressed`]`(true)` on the
+/// destination buffer **before** passing it to any consumer.  This flag tells downstream
+/// stages (Module 5 checkpoint decompressor) that the buffer holds the packed INT8 format
+/// rather than raw FP16 weights.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn compress_checkpoint_fp16_to_int8(
     src_device: *const u16,
@@ -258,8 +337,7 @@ fn mock_compress_checkpoint(
         let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
         *scale_slot = scale;
         for (offset, bits) in channel.iter().enumerate() {
-            let quantized = (fp16_bits_to_f32(*bits) / scale)
-                .round()
+            let quantized = round_half_to_even(fp16_bits_to_f32(*bits) / scale)
                 .clamp(-128.0, 127.0);
             dst[start + offset] = quantized as i8;
         }
@@ -410,5 +488,19 @@ mod tests {
 
         assert!(scales.iter().all(|scale| *scale > 0.0));
         assert!(restored.iter().any(|bits| *bits != 0));
+    }
+
+    #[test]
+    fn mock_rounding_matches_cuda_float2int_rn_on_tie_values() {
+        // CUDA __float2int_rn uses round-half-to-even (IEEE 754 default).
+        // 2.5 → 2 (2 is even), 3.5 → 4 (4 is even), -0.5 → 0 (0 is even), 1.5 → 2.
+        assert_eq!(round_half_to_even(2.5_f32) as i32, 2, "2.5 → 2 (round-to-even)");
+        assert_eq!(round_half_to_even(3.5_f32) as i32, 4, "3.5 → 4 (round-to-even)");
+        assert_eq!(round_half_to_even(-0.5_f32) as i32, 0, "-0.5 → 0 (round-to-even)");
+        assert_eq!(round_half_to_even(1.5_f32) as i32, 2, "1.5 → 2 (round-to-even)");
+        assert_eq!(round_half_to_even(4.5_f32) as i32, 4, "4.5 → 4 (round-to-even)");
+        // Non-tie values must behave identically to f32::round().
+        assert_eq!(round_half_to_even(2.7_f32) as i32, 3, "2.7 → 3");
+        assert_eq!(round_half_to_even(2.2_f32) as i32, 2, "2.2 → 2");
     }
 }

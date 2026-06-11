@@ -115,6 +115,13 @@ impl Default for ZeroCopyRouter {
 }
 
 pub(crate) fn device_pointer_for_mapped_buffer(buf: &PinnedBuffer) -> Result<DevicePointer> {
+    if !buf.is_mapped() {
+        return Err(crate::RamFlowError::ConfigError(
+            "device_pointer_for_mapped_buffer called on an unmapped PinnedBuffer: \
+             allocate with PinnedBuffer::alloc_mapped() for UVA/zero-copy access"
+                .into(),
+        ));
+    }
     let raw = unsafe { cuda_host_get_device_pointer(buf.as_ptr() as *mut c_void)? };
     Ok(unsafe { DevicePointer::from_raw(raw as *mut u8) })
 }
@@ -183,6 +190,40 @@ mod tests {
             zero_copy_time_score(8 * 1024 * 1024) > dma_copy_time_score(8 * 1024 * 1024),
             "DMA should win at 8 MiB"
         );
+    }
+
+    #[test]
+    fn mapped_large_buffer_above_threshold_routes_to_dma() {
+        // Threshold is 4 MiB; an 8 MiB mapped buffer must route to DMA (too large for zero-copy).
+        let buffer = PinnedBuffer::alloc_mapped(8 * 1024 * 1024).expect("mapped alloc 8 MiB");
+        let stream = CudaStream::new().expect("stream");
+        ZeroCopyRouter::set_threshold(4 * 1024 * 1024);
+        match ZeroCopyRouter::new()
+            .route(&buffer, &stream)
+            .expect("route")
+        {
+            TransferStrategy::ZeroCopy { .. } => {
+                panic!("8 MiB mapped buffer exceeds 4 MiB threshold — must route to DMA")
+            }
+            TransferStrategy::DmaCopy { .. } => {}
+        }
+    }
+
+    #[test]
+    fn unmapped_large_buffer_above_threshold_routes_to_dma() {
+        // Unmapped buffers always DMA regardless of size.
+        let buffer = PinnedBuffer::alloc(8 * 1024 * 1024).expect("alloc 8 MiB");
+        let stream = CudaStream::new().expect("stream");
+        ZeroCopyRouter::set_threshold(4 * 1024 * 1024);
+        match ZeroCopyRouter::new()
+            .route(&buffer, &stream)
+            .expect("route")
+        {
+            TransferStrategy::ZeroCopy { .. } => {
+                panic!("unmapped buffer must never route to zero-copy")
+            }
+            TransferStrategy::DmaCopy { .. } => {}
+        }
     }
 
     fn zero_copy_time_score(size_bytes: usize) -> usize {

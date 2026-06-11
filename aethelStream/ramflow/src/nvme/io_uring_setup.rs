@@ -100,6 +100,7 @@ impl IoUringInstance {
             if params.try_sqpoll {
                 let sqpoll_result = IoUring::builder()
                     .setup_sqpoll(2000) // kernel thread idles after 2000ms
+                    .setup_cqe_size(params.cq_entries)
                     .build(params.sq_entries);
 
                 if let Ok(ring) = sqpoll_result {
@@ -121,7 +122,9 @@ impl IoUringInstance {
             }
 
             // --- Standard mode ---
-            let standard_result = IoUring::builder().build(params.sq_entries);
+            let standard_result = IoUring::builder()
+                .setup_cqe_size(params.cq_entries)
+                .build(params.sq_entries);
             let ring = match standard_result {
                 Ok(ring) => ring,
                 Err(error) => {

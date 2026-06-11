@@ -66,7 +66,7 @@ where
     #[cfg(unix)]
     install_signal_handlers();
 
-    let worker = start_signal_worker(Arc::clone(&active));
+    let worker = start_signal_worker(Arc::clone(&active))?;
 
     Ok(EmergencyCheckpointGuard {
         active,
@@ -108,22 +108,25 @@ fn run_registered_flush() -> Result<bool> {
     Ok(true)
 }
 
-fn start_signal_worker(active: Arc<AtomicBool>) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        while active.load(Ordering::Acquire) {
-            let signal = PENDING_SIGNAL.swap(0, Ordering::AcqRel);
-            if signal == 0 {
-                thread::sleep(Duration::from_millis(10));
-                continue;
+fn start_signal_worker(active: Arc<AtomicBool>) -> crate::Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("ramflow-emergency-checkpoint".into())
+        .spawn(move || {
+            while active.load(Ordering::Acquire) {
+                let signal = PENDING_SIGNAL.swap(0, Ordering::AcqRel);
+                if signal == 0 {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+
+                let _ = run_registered_flush();
+                active.store(false, Ordering::Release);
+
+                #[cfg(unix)]
+                reraise_signal(signal);
             }
-
-            let _ = run_registered_flush();
-            active.store(false, Ordering::Release);
-
-            #[cfg(unix)]
-            reraise_signal(signal);
-        }
-    })
+        })
+        .map_err(crate::RamFlowError::IoUringError)
 }
 
 #[cfg(unix)]

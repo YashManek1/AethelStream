@@ -130,12 +130,12 @@ fn test_9_per_layer_scale_table_no_cross_contamination() {
     let mut table = PerLayerScaleTable::new(NUM_LAYERS, 0.05);
 
     for _ in 0..STEPS {
-        table.update(TARGET_LAYER, N_TOTAL, N_OVERFLOW);
+        table.update(TARGET_LAYER, N_TOTAL, N_OVERFLOW).expect("update TARGET_LAYER");
     }
 
     // EWA with alpha=0.05 and constant fraction=0.03 after 100 steps:
     //   d = 0.03 * (1 - 0.95^100) ~= 0.0298  (within +/-10% of 0.03)
-    let density = table.get_density(TARGET_LAYER);
+    let density = table.get_density(TARGET_LAYER).expect("get_density TARGET_LAYER");
     assert!(
         (density - 0.03_f32).abs() <= 0.003_f32,
         "density[{TARGET_LAYER}] must converge to 0.030 +/-10%, got {density:.6}"
@@ -143,9 +143,9 @@ fn test_9_per_layer_scale_table_no_cross_contamination() {
 
     // density > 0.001 from step 1 -> scale is halved every step -> scale = 1.0.
     assert!(
-        table.get_scale(TARGET_LAYER) < 65536.0_f32,
+        table.get_scale(TARGET_LAYER).expect("get_scale TARGET_LAYER") < 65536.0_f32,
         "scale[{TARGET_LAYER}] must be reduced from 65536.0, got {}",
-        table.get_scale(TARGET_LAYER)
+        table.get_scale(TARGET_LAYER).expect("get_scale TARGET_LAYER display")
     );
 
     // No other layer was ever updated — zero cross-contamination.
@@ -154,12 +154,12 @@ fn test_9_per_layer_scale_table_no_cross_contamination() {
             continue;
         }
         assert_eq!(
-            table.get_density(layer_idx),
+            table.get_density(layer_idx).expect("get_density clean layer"),
             0.0_f32,
             "density[{layer_idx}] must be 0.0 (never updated)"
         );
         assert_eq!(
-            table.get_scale(layer_idx),
+            table.get_scale(layer_idx).expect("get_scale clean layer"),
             65536.0_f32,
             "scale[{layer_idx}] must remain at 65536.0 (never updated)"
         );

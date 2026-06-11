@@ -157,15 +157,28 @@ impl PerLayerScaleTable {
     ///
     /// `n_total` — total FP16 elements in the gradient tensor.
     /// `n_overflow` — NaN/Inf elements counted by `count_overflow_fp16` kernel.
-    pub fn update(&mut self, layer_idx: usize, n_total: usize, n_overflow: u32) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::RamFlowError::ConfigError`] if `layer_idx` is out of bounds for
+    /// this table (i.e., >= the number of layers the table was constructed with).
+    pub fn update(
+        &mut self,
+        layer_idx: usize,
+        n_total: usize,
+        n_overflow: u32,
+    ) -> Result<(), crate::RamFlowError> {
         if layer_idx >= self.density.len() {
-            return;
+            return Err(crate::RamFlowError::ConfigError(format!(
+                "PerLayerScaleTable::update: layer_idx {layer_idx} out of bounds (table has {} layers)",
+                self.density.len()
+            )));
         }
         if n_total == 0 {
-            return;
+            return Ok(());
         }
         if self.bf16_mode {
-            return;
+            return Ok(());
         }
 
         let fraction = n_overflow as f32 / n_total as f32;
@@ -177,21 +190,42 @@ impl PerLayerScaleTable {
         } else if new_density < self.overflow_low_threshold && self.scale[layer_idx] < 65536.0 {
             self.scale[layer_idx] = (self.scale[layer_idx] * 2.0).min(65536.0);
         }
+        Ok(())
     }
 
     /// Current loss scale for `layer_idx`.
     ///
     /// Returns 1.0 for all layers when `bf16_mode` is active.
-    pub fn get_scale(&self, layer_idx: usize) -> f32 {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::RamFlowError::ConfigError`] if `layer_idx` is out of bounds for
+    /// this table (i.e., >= the number of layers the table was constructed with).
+    pub fn get_scale(&self, layer_idx: usize) -> Result<f32, crate::RamFlowError> {
         if self.bf16_mode {
-            return 1.0;
+            return Ok(1.0);
         }
-        self.scale.get(layer_idx).copied().unwrap_or(1.0)
+        self.scale.get(layer_idx).copied().ok_or_else(|| {
+            crate::RamFlowError::ConfigError(format!(
+                "PerLayerScaleTable::get_scale: layer_idx {layer_idx} out of bounds (table has {} layers)",
+                self.scale.len()
+            ))
+        })
     }
 
     /// Current EWA overflow density for `layer_idx`.
-    pub fn get_density(&self, layer_idx: usize) -> f32 {
-        self.density.get(layer_idx).copied().unwrap_or(0.0)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::RamFlowError::ConfigError`] if `layer_idx` is out of bounds for
+    /// this table (i.e., >= the number of layers the table was constructed with).
+    pub fn get_density(&self, layer_idx: usize) -> Result<f32, crate::RamFlowError> {
+        self.density.get(layer_idx).copied().ok_or_else(|| {
+            crate::RamFlowError::ConfigError(format!(
+                "PerLayerScaleTable::get_density: layer_idx {layer_idx} out of bounds (table has {} layers)",
+                self.density.len()
+            ))
+        })
     }
 
     /// Update the gradient variance estimate for `layer_idx` (Idea 1 signal).
@@ -417,5 +451,16 @@ impl CoScheduler {
     /// Module 3 uses this to call `sample_and_notify` from the training loop.
     pub fn gauge(&self) -> &MemoryPressureGauge {
         &self.gauge
+    }
+
+    /// Whether the compression subsystem should currently compress gradient checkpoints.
+    ///
+    /// Returns `true` when a soft-pressure event has fired and the pressure is between the
+    /// soft threshold (0.70) and the high threshold (0.80). Module 5 calls this before
+    /// each backward step to decide whether to compress activation checkpoints.
+    ///
+    /// Uses `Ordering::Acquire` to observe the `Release` store from the pressure callback.
+    pub fn should_compress_checkpoints(&self) -> bool {
+        self.compress_trigger.load(std::sync::atomic::Ordering::Acquire)
     }
 }

@@ -72,14 +72,18 @@ impl Default for NvlinkPeerSync {
 impl PeerSync for NvlinkPeerSync {
     fn broadcast_ready(&self, _layer_idx: u32) -> Result<()> {
         #[cfg(feature = "multi-gpu")]
-        unimplemented!("NvlinkPeerSync: multi-gpu broadcast not yet implemented");
+        return Err(crate::FlowCastError::Config(
+            "NvlinkPeerSync: multi-gpu broadcast not yet implemented".to_string(),
+        ));
         #[cfg(not(feature = "multi-gpu"))]
         Ok(())
     }
 
     fn wait_peer_ready(&self, _layer_idx: u32) -> Result<()> {
         #[cfg(feature = "multi-gpu")]
-        unimplemented!("NvlinkPeerSync: multi-gpu wait not yet implemented");
+        return Err(crate::FlowCastError::Config(
+            "NvlinkPeerSync: multi-gpu wait not yet implemented".to_string(),
+        ));
         #[cfg(not(feature = "multi-gpu"))]
         Ok(())
     }

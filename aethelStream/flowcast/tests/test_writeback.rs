@@ -41,16 +41,15 @@ fn write_submitted_and_data_matches() {
     assert_eq!(completions.len(), 1, "expected exactly 1 write completion");
     assert!(completions[0].result >= 0, "write should succeed");
 
-    // Simulate re-read: the backend accepted the src buffer bytes.
-    // We verify the written byte pattern matches what was passed in.
+    // Byte-identical read-back via MockBackend's written store (A4-e fix).
     let written_len = completions[0].result as usize;
     assert_eq!(written_len, 256, "written length should match src");
 
-    // Value check: all bytes were 0xAB.
-    // (On a real NVMe we'd re-read; here we trust the mock echoed length=256.)
+    let written = backend.last_written_bytes(3).expect("written bytes must be stored by mock");
+    assert_eq!(written.len(), 256, "written byte count must match src");
     assert!(
-        src.as_slice().iter().all(|&b| b == 0xAB),
-        "source buffer content unchanged after write"
+        written.iter().all(|&b| b == 0xAB),
+        "all written bytes must be 0xAB (byte-identical round-trip)"
     );
 }
 

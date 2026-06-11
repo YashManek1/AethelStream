@@ -29,11 +29,12 @@ pub enum DecodeState {
 }
 
 // NF4 lookup table: 16 normalised-float levels (bitsandbytes convention).
+// Literals are truncated to the precision representable by f32 (~7 decimal digits).
 const NF4_TABLE: [f32; 16] = [
-    -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
-    -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
-    0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
-    0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0,
+    -1.0, -0.696_192_8, -0.525_073_05, -0.394_917_5,
+    -0.284_441_38, -0.184_773_43, -0.091_050_036, 0.0,
+    0.079_580_3, 0.160_930_2, 0.246_112_3, 0.337_915_24,
+    0.440_709_83, 0.562_617, 0.722_956_84, 1.0,
 ];
 
 /// Quantized-stream decode coordinator.
@@ -65,11 +66,7 @@ impl QuantizedDecoder {
         scale_per_channel: &[f32],
         num_channels: usize,
     ) -> Vec<u8> {
-        let elements_per_channel = if num_channels == 0 {
-            src_int8.len()
-        } else {
-            src_int8.len() / num_channels
-        };
+        let elements_per_channel = src_int8.len().checked_div(num_channels).unwrap_or(src_int8.len());
 
         let mut out = Vec::with_capacity(src_int8.len() * 2);
         for (element_idx, &raw) in src_int8.iter().enumerate() {
@@ -107,27 +104,63 @@ impl QuantizedDecoder {
         out
     }
 
-    /// Dispatch decode for `layer_idx` given its source precision.
+    /// Dispatch and execute decode for `layer_idx` given its source precision.
     ///
-    /// Under `mock-cuda` completes synchronously (no GPU kernel).
-    /// Under real CUDA dispatches an async kernel and returns immediately;
-    /// caller must await `Done` via `decode_state`.
+    /// Calls the appropriate CPU decode function (A7-d fix — the previous stub
+    /// marked `Done` without calling any decode logic).  After decoding, verifies
+    /// that the output has the expected FP16 byte count (A7-e shape check).
+    ///
+    /// * INT8: calls `decode_int8_to_fp16`; expects `src_bytes.len() * 2` output bytes.
+    /// * INT4: calls `decode_int4_to_fp16`; expects `src_bytes.len() * 4` output bytes.
+    /// * FP16/BF16/FP32: returns `src_bytes` verbatim (no decode required).
     ///
     /// # Errors
-    /// Always `Ok(())` in this implementation (kernel errors are future work).
-    pub fn dispatch(&self, layer_idx: u32, source_precision: Precision) -> Result<()> {
-        let mut states = self.states.lock().unwrap_or_else(|p| p.into_inner());
-        match source_precision {
-            Precision::INT8 | Precision::INT4 => {
-                // mock-cuda: mark Done immediately (kernel is simulated).
-                states.insert(layer_idx, DecodeState::Done);
+    /// Returns `FlowCastError::Config` if the output size does not match the
+    /// expected FP16 byte count (invariant violation).
+    pub fn dispatch(
+        &self,
+        layer_idx: u32,
+        source_precision: Precision,
+        src_bytes: &[u8],
+        scale_per_channel: &[f32],
+        absmax: f32,
+        num_channels: usize,
+    ) -> crate::Result<Vec<u8>> {
+        let output = match source_precision {
+            Precision::INT8 => {
+                let decoded = Self::decode_int8_to_fp16(src_bytes, scale_per_channel, num_channels);
+                let expected_fp16_bytes = src_bytes.len() * 2;
+                if decoded.len() != expected_fp16_bytes {
+                    return Err(crate::FlowCastError::Config(format!(
+                        "INT8 decode shape mismatch: src={} bytes → expected {expected_fp16_bytes} FP16 bytes, got {}",
+                        src_bytes.len(),
+                        decoded.len(),
+                    )));
+                }
+                decoded
+            }
+            Precision::INT4 => {
+                let decoded = Self::decode_int4_to_fp16(src_bytes, absmax);
+                let expected_fp16_bytes = src_bytes.len() * 4;
+                if decoded.len() != expected_fp16_bytes {
+                    return Err(crate::FlowCastError::Config(format!(
+                        "INT4 decode shape mismatch: src={} bytes → expected {expected_fp16_bytes} FP16 bytes, got {}",
+                        src_bytes.len(),
+                        decoded.len(),
+                    )));
+                }
+                decoded
             }
             _ => {
-                // FP16/BF16/FP32 — no decode needed.
-                states.insert(layer_idx, DecodeState::Done);
+                // FP16/BF16/FP32 — no decode required; return verbatim.
+                src_bytes.to_vec()
             }
-        }
-        Ok(())
+        };
+
+        let mut states = self.states.lock().unwrap_or_else(|p| p.into_inner());
+        states.insert(layer_idx, DecodeState::Done);
+
+        Ok(output)
     }
 
     /// Query the decode state for `layer_idx`.

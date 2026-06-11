@@ -5,10 +5,11 @@
 //! T-INT-2: Simulated GPU idle < 20% over 4 layers.
 //! T-INT-3: Telemetry snapshot counters match independently-counted events.
 //! T-INT-4: NaN-injection echoed through PerLayerScaleTable (scale update).
-//! T-INT-5: Delayed write-back completes without error.
+//! T-INT-5: Delayed write-back completes without error; byte-identical read-back.
 //! T-INT-6: Linux RSS check (skipped on non-Linux).
 //! T-INT-7: PeerSync compiles and SingleGpuSync is no-op.
 //! T-INT-8: Telemetry JSON validates (round-trip).
+//! T-INT-9: Pressure event shrinks the adaptive window.
 
 use flowcast::{
     backend::{mock::MockBackend, IoBackend},
@@ -18,8 +19,10 @@ use flowcast::telemetry::Telemetry;
 use flowcast::writeback::{WritebackConfig, WritebackMode, WritebackScheduler};
 use flowcast::peer::{PeerSync, SingleGpuSync};
 use flowcast::state_machine::PrefetchStateMachine;
+use flowcast::window::AdaptiveWindow;
 use ramflow::{PoolRegistry, PerLayerScaleTable};
 use ramflow::phase::Direction as RamDirection;
+use ramflow::MemoryPressureGauge;
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
@@ -57,6 +60,7 @@ fn test_all_public_types_accessible() {
             backward_ms: 24.0,
             shard_bytes: 1024 * 1024,
             transfer_ms: 1.2,
+            ..Default::default()
         }],
     };
     assert_eq!(profile.layer_plan.len(), 1);
@@ -71,6 +75,7 @@ fn test_all_public_types_accessible() {
     fn _assert_ready_layer_fields(r: ReadyLayer) {
         let _: u32 = r.layer_idx;
         let _: Precision = r.precision;
+        let _ = r.needs_decode;
     }
 }
 
@@ -92,7 +97,7 @@ fn test_config_validate_rejects_bad_fields() {
 }
 
 // ---------------------------------------------------------------------------
-// T-INT-1: 2-cycle forward+backward, zero PrefetchMiss
+// T-INT-1: 2-cycle forward+backward, zero PrefetchMiss (INT-a fix: backward pass added)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -103,53 +108,101 @@ fn end_to_end_two_cycles_zero_prefetch_miss() {
     let pool = PoolRegistry::with_defaults().expect("pool");
     let backend = MockBackend::new();
     let sm = PrefetchStateMachine::new(NUM_LAYERS, LOOKAHEAD, Precision::FP16);
-    let mut miss_count = 0u32;
+    let telemetry = Telemetry::new();
 
-    // Prime forward window.
-    sm.prime_window(RamDirection::Forward, &pool, &backend).expect("prime");
-    // Drain completions from prime into ready map.
+    // --- Forward pass ---
+    sm.prime_window(RamDirection::Forward, &pool, &backend).expect("prime forward");
     sm.poll_and_route(&backend).expect("poll_and_route after prime");
 
-    // Forward pass: layers 0..4
     for layer in 0..NUM_LAYERS {
         sm.on_layer_start(layer, RamDirection::Forward, &pool, &backend)
             .expect("on_layer_start forward");
-        // Drain any new completions submitted by on_layer_start.
-        sm.poll_and_route(&backend).expect("poll_and_route");
+        sm.poll_and_route(&backend).expect("poll_and_route forward");
 
         match sm.take_ready(layer, std::time::Duration::from_millis(100)) {
             Ok(_ready) => {}
-            Err(FlowCastError::PrefetchMiss { .. }) => miss_count += 1,
+            Err(FlowCastError::PrefetchMiss { .. }) => {
+                telemetry.record_miss();
+            }
             Err(e) => panic!("unexpected error: {e}"),
         }
     }
 
-    assert_eq!(miss_count, 0, "expected zero PrefetchMiss in forward pass, got {miss_count}");
+    // --- Backward pass (INT-a fix) ---
+    sm.prime_window(RamDirection::Backward, &pool, &backend).expect("prime backward");
+    sm.poll_and_route(&backend).expect("poll_and_route after bwd prime");
+
+    for layer in (0..NUM_LAYERS).rev() {
+        sm.on_layer_start(layer, RamDirection::Backward, &pool, &backend)
+            .expect("on_layer_start backward");
+        sm.poll_and_route(&backend).expect("poll_and_route backward");
+
+        match sm.take_ready(layer, std::time::Duration::from_millis(100)) {
+            Ok(_ready) => {}
+            Err(FlowCastError::PrefetchMiss { .. }) => {
+                telemetry.record_miss();
+            }
+            Err(e) => panic!("unexpected error backward: {e}"),
+        }
+    }
+
+    // Use telemetry.miss_count (INT-b fix: telemetry counter instead of manual variable).
+    let snap = telemetry.snapshot();
+    assert_eq!(
+        snap.miss_count, 0,
+        "expected zero PrefetchMiss in forward+backward pass, got {}",
+        snap.miss_count
+    );
 }
 
 // ---------------------------------------------------------------------------
-// T-INT-2: Simulated GPU idle < 20% over 4 layers
+// T-INT-2: Simulated GPU idle < 20% over 8 layers
 // ---------------------------------------------------------------------------
 
 #[test]
 fn simulated_gpu_idle_below_20_percent() {
-    const NUM_LAYERS: u32 = 4;
-    let telemetry = Telemetry::new();
-    let start = Instant::now();
+    use std::sync::Arc;
+    use flowcast::completion_router::CompletionRouter;
 
-    for _ in 0..NUM_LAYERS {
-        telemetry.record_layer_start();
-        // Simulate GPU kernel: sleep 1 ms (real work >> idle on mock path).
-        std::thread::sleep(std::time::Duration::from_millis(1));
+    const NUM_LAYERS: u32 = 8;
+    const COMPUTE_MS: u64 = 5;
+
+    let pool = PoolRegistry::with_defaults().expect("pool");
+    let backend = Arc::new(MockBackend::new());
+    let sm = Arc::new(PrefetchStateMachine::new(NUM_LAYERS, 2, Precision::FP16));
+    let _router = CompletionRouter::spawn(backend.clone(), sm.clone())
+        .expect("CompletionRouter::spawn");
+
+    sm.prime_window(Direction::Forward, &pool, &*backend)
+        .expect("prime_window");
+
+    let total_start = Instant::now();
+    let mut total_wait_us: u64 = 0;
+
+    for layer_idx in 0..NUM_LAYERS {
+        sm.on_layer_start(layer_idx, Direction::Forward, &pool, &*backend)
+            .expect("on_layer_start");
+
+        let wait_start = Instant::now();
+        let _ready = sm
+            .take_ready(layer_idx, std::time::Duration::from_millis(500))
+            .unwrap_or_else(|e| panic!("layer {layer_idx}: {e}"));
+        total_wait_us += wait_start.elapsed().as_micros() as u64;
+
+        std::thread::sleep(std::time::Duration::from_millis(COMPUTE_MS));
     }
 
-    let elapsed_us = start.elapsed().as_micros() as u64;
-    let snap = telemetry.snapshot();
-    let idle_frac = snap.gpu_idle_fraction(elapsed_us);
+    let elapsed_us = total_start.elapsed().as_micros() as u64;
+    let idle_frac = if elapsed_us == 0 {
+        0.0_f64
+    } else {
+        total_wait_us as f64 / elapsed_us as f64
+    };
 
     assert!(
         idle_frac < 0.20,
-        "GPU idle fraction {idle_frac:.3} ≥ 20% — prefetch not hiding I/O"
+        "GPU idle fraction {idle_frac:.3} ≥ 20% — prefetch not hiding I/O \
+         (wait={total_wait_us}μs, elapsed={elapsed_us}μs)"
     );
 }
 
@@ -201,19 +254,16 @@ fn telemetry_counters_match_independent_counts() {
 fn nan_injection_updates_scale_table() {
     let mut scale_table = PerLayerScaleTable::new(8, 0.05);
 
-    // Inject a massive overflow: all elements overflow → density → 1.0.
-    // After enough updates the scale halves toward floor=1.0.
     for _ in 0..20 {
-        scale_table.update(3, 1_000_000, 1_000_000); // 100% overflow
+        scale_table.update(3, 1_000_000, 1_000_000).expect("update layer 3");
     }
-    let scale = scale_table.get_scale(3);
-    // Scale should have been halved repeatedly → near 1.0 (floor).
+    let scale = scale_table.get_scale(3).expect("get_scale layer 3");
     assert!(scale <= 2.0, "scale {scale} should be near floor after NaN injection");
     assert!(scale >= 1.0, "scale {scale} must never go below 1.0");
 }
 
 // ---------------------------------------------------------------------------
-// T-INT-5: Delayed write-back completes without error
+// T-INT-5: Delayed write-back completes without error + byte-identical read-back (INT-e fix)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -227,12 +277,30 @@ fn delayed_writeback_completes_without_error() {
     };
     let mut sched = WritebackScheduler::with_config(WritebackMode::Immediate, config);
 
-    let buf = ramflow::PinnedBuffer::alloc(256).expect("alloc");
+    // Build a buffer with a known pattern for byte-identical verification (INT-e fix).
+    let mut buf = ramflow::PinnedBuffer::alloc(256).expect("alloc");
+    let buf_data = buf.as_mut_slice();
+    for (idx, byte) in buf_data.iter_mut().enumerate() {
+        *byte = (idx % 256) as u8;
+    }
+
     sched.on_weights_updated(0, &buf, 0, 1.0, &backend).expect("on_weights_updated");
 
     let completions = backend.poll_completions().expect("poll");
     assert_eq!(completions.len(), 1, "write-back must complete");
     assert!(completions[0].result >= 0, "write must succeed");
+
+    // Verify byte-identical read-back via MockBackend's written store (INT-e fix).
+    let written = backend.last_written_bytes(0).expect("written bytes must be stored");
+    assert_eq!(written.len(), 256, "written length must match buffer size");
+    for (idx, &byte) in written.iter().enumerate() {
+        assert_eq!(
+            byte,
+            (idx % 256) as u8,
+            "byte at index {idx} mismatch: expected {}, got {byte}",
+            (idx % 256) as u8
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -242,7 +310,6 @@ fn delayed_writeback_completes_without_error() {
 #[test]
 #[cfg_attr(not(target_os = "linux"), ignore = "RSS check Linux-only")]
 fn linux_rss_does_not_spike_after_prefetch() {
-    // Read /proc/self/status VmRSS before and after allocating a 1 MiB buffer.
     fn read_rss_kb() -> u64 {
         let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
         for line in status.lines() {
@@ -260,7 +327,6 @@ fn linux_rss_does_not_spike_after_prefetch() {
     let _buf = ramflow::PinnedBuffer::alloc(1024 * 1024).expect("alloc 1 MiB");
     let after = read_rss_kb();
 
-    // RSS growth must be < 64 MiB (1 MiB alloc + OS overhead).
     let growth_kb = after.saturating_sub(before);
     assert!(
         growth_kb < 64 * 1024,
@@ -299,10 +365,8 @@ fn telemetry_json_round_trips() {
     let snap = telemetry.snapshot();
     let json = snap.to_json().expect("to_json");
 
-    // Must be valid JSON.
     let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse JSON");
 
-    // Spot-check a few fields.
     assert_eq!(parsed["prefetch_submitted"].as_u64(), Some(1));
     assert_eq!(parsed["nvme_bytes_read"].as_u64(), Some(4096));
     assert_eq!(parsed["decode_ns"].as_u64(), Some(999));
@@ -310,4 +374,50 @@ fn telemetry_json_round_trips() {
     assert_eq!(parsed["ready_queue_depth"].as_u64(), Some(1));
     assert_eq!(parsed["window_grow_events"].as_u64(), Some(1));
     assert_eq!(parsed["hotset_hits"].as_u64(), Some(1));
+}
+
+// ---------------------------------------------------------------------------
+// T-INT-9: Memory pressure event shrinks the adaptive window (INT-d fix)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn memory_pressure_event_shrinks_window() {
+    const W_MAX: f32 = 8.0;
+    let gauge = MemoryPressureGauge::new(1);
+    let mut window = AdaptiveWindow::new(W_MAX, 0.2, W_MAX);
+    window.register_pressure_callbacks(&gauge, None);
+
+    // Verify window starts at W_MAX.
+    assert_eq!(window.t_iter(), W_MAX);
+
+    // Fire high-pressure event → window should cap at 1.
+    gauge.signal_stall(0);
+    assert!(
+        window.pressure_cap_active(),
+        "pressure cap must be active after signal_stall"
+    );
+    assert_eq!(window.t_iter(), 1.0, "window must be capped at 1 under high pressure");
+
+    // Pump one A2 update with grow condition — cap must still win.
+    window.update(10.0, 1.0).unwrap(); // ssd=10ms > 0.8*gpu=0.8ms → would grow
+    assert_eq!(window.t_iter(), 1.0, "cap persists through A2 update");
+
+    // Record that at least one shrink event happened (via pressure cap).
+    let snap_before_lift = window.t_iter();
+    assert!(
+        snap_before_lift <= 1.0,
+        "window must be ≤ 1.0 under high pressure, got {snap_before_lift}"
+    );
+
+    // Lift pressure; confirm growth is now possible.
+    let pool = PoolRegistry::with_defaults().expect("pool");
+    gauge.sample_and_notify(&pool); // 0 fill → low pressure
+    assert!(!window.pressure_cap_active(), "cap must be lifted after sample_and_notify");
+
+    window.update(10.0, 1.0).unwrap(); // grow condition again, no cap
+    assert!(
+        window.t_iter() > 1.0,
+        "window must grow above 1 after pressure lifts, got {}",
+        window.t_iter()
+    );
 }

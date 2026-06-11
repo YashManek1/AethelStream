@@ -83,7 +83,7 @@ fn is_resident_matches_residency() {
     for layer in 0..NUM_LAYERS {
         let expected = residents.contains(&layer);
         assert_eq!(
-            hotset.is_resident(layer),
+            hotset.is_resident(layer, &scale_table),
             expected,
             "is_resident({layer}) mismatch"
         );
@@ -109,7 +109,7 @@ fn lfu_promotion_with_headroom() {
     let threshold: u64 = 1 * 1024 * 1024 * 1024;       // 1 GiB
 
     hotset.record_access(5, large_headroom, threshold, &mut scale_table);
-    assert!(hotset.is_resident(5), "layer 5 should be promoted with headroom");
+    assert!(hotset.is_resident(5, &scale_table), "layer 5 should be promoted with headroom");
     assert!(scale_table.is_resident(5), "scale_table should reflect promotion");
 }
 
@@ -136,8 +136,8 @@ fn lfu_eviction_when_full() {
     hotset.record_access(7, large_headroom, threshold, &mut scale_table);
 
     // Layer 7 (count=3) > layer 4 (count=1) → layer 4 evicted, layer 7 promoted.
-    assert!(hotset.is_resident(7), "layer 7 should be promoted");
-    assert!(!hotset.is_resident(4), "layer 4 (LFU) should be evicted");
+    assert!(hotset.is_resident(7, &scale_table), "layer 7 should be promoted");
+    assert!(!hotset.is_resident(4, &scale_table), "layer 4 (LFU) should be evicted");
     assert!(!scale_table.is_resident(4), "scale_table should reflect eviction of layer 4");
     assert!(scale_table.is_resident(7), "scale_table should reflect promotion of layer 7");
 }

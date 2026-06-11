@@ -57,7 +57,15 @@ use std::sync::{Arc, Mutex};
 /// Module 3 uses it as a tensor_id or a (layer_idx, tensor_name) hash.
 pub type PrefetchToken = u64;
 
-/// Sector alignment required by `O_DIRECT` for offsets, lengths, and buffers.
+/// Sector alignment required by O_DIRECT for buffer addresses, byte offsets, and
+/// transfer lengths (NVMe logical-sector size).
+///
+/// **Must equal `crate::allocator::pinned::PINNED_ALIGN`** (also 512): every
+/// `PinnedBuffer` is allocated with `posix_memalign(512)` / `_aligned_malloc(512)`,
+/// so its address is guaranteed to satisfy this constraint.  A 64-byte-aligned
+/// buffer would satisfy CPU cache-line DMA requirements but only 1-in-8 such
+/// addresses are also 512-byte aligned, making O_DIRECT reads EINVAL on the
+/// other 7/8.
 pub const DIRECT_IO_ALIGNMENT: usize = 512;
 
 /// Validate the `O_DIRECT` triple: file offset, transfer length, and buffer address.
@@ -445,10 +453,27 @@ impl PrefetchEngine {
 
     /// Schedule a grouped contiguous read for consecutive layers.
     ///
-    /// The caller keeps per-layer offsets in `layer_offsets`; this method only
-    /// submits the single super-shard read when the feature flag is enabled.
-    /// With the default disabled config, it falls back to a normal single read
-    /// for the requested byte range.
+    /// The caller keeps per-layer offsets in `layer_offsets`; this method
+    /// validates each offset against the merged read range and then submits a
+    /// single SQE covering `[byte_offset, byte_offset + length)`.
+    ///
+    /// # Super-shard enabled path
+    /// Every element of `layer_offsets` must be a relative offset within the
+    /// merged buffer, i.e. strictly less than `length`.  An out-of-range offset
+    /// returns `Err(ConfigError)` rather than silently allowing an invalid read.
+    ///
+    /// # Fallback conditions
+    /// Falls back to a standard single-layer `schedule()` call when:
+    /// - `config.enabled` is false (default), **or**
+    /// - `layer_offsets` is empty (nothing to merge), **or**
+    /// - `length > config.target_bytes` (the merged read would exceed the
+    ///   configured super-shard size limit).
+    ///
+    /// # Returns
+    /// `Ok(())` if the SQE was submitted.
+    /// `Err(ConfigError)` if any `layer_offsets` element is out of range.
+    /// `Err(PressurePause)` if the co-scheduler has paused prefetching.
+    /// `Err(IoUringError)` if the SQE submission fails.
     pub fn schedule_super_shard(
         &self,
         shard_id: u32,
@@ -459,10 +484,28 @@ impl PrefetchEngine {
         layer_offsets: &[u64],
     ) -> Result<()> {
         let config = self.super_shard_config();
-        if !config.enabled || length > config.target_bytes || layer_offsets.is_empty() {
+
+        if !config.enabled || layer_offsets.is_empty() || length > config.target_bytes {
+            // Super-shard disabled or oversized — fall back to a standard single-layer read.
             return self.schedule(shard_id, byte_offset, length, dst, token);
         }
 
+        // Validate that every layer offset falls within the merged read range
+        // [0, length).  Callers compute the merged byte_offset as the minimum
+        // of all constituent layer offsets; individual layer offsets here are
+        // relative to byte_offset (i.e. relative within the merged buffer dst).
+        for (index, &layer_off) in layer_offsets.iter().enumerate() {
+            if layer_off >= length {
+                return Err(crate::RamFlowError::ConfigError(format!(
+                    "super-shard layer_offsets[{index}] = {layer_off} exceeds merged range \
+                     length {length} for shard {shard_id}"
+                )));
+            }
+        }
+
+        // One merged SQE covers [byte_offset, byte_offset + length) on the NVMe device.
+        // After completion the caller demultiplexes individual layers from dst using the
+        // validated layer_offsets slice.
         self.schedule(shard_id, byte_offset, length, dst, token)
     }
 

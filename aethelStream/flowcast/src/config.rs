@@ -26,6 +26,12 @@ pub enum Precision {
     INT4,
 }
 
+/// Opaque CUDA device pointer (raw 64-bit address in GPU address space).
+///
+/// Stored as `u64` so the type is usable in non-CUDA builds without conditional
+/// compilation on every struct that carries device pointers.
+pub type DevicePointer = u64;
+
 /// Per-layer timing record produced by the warm-up profiler.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayerTiming {
@@ -43,6 +49,24 @@ pub struct LayerTiming {
 
     /// Estimated NVMe → RAM transfer time at measured bandwidth (milliseconds).
     pub transfer_ms: f32,
+
+    /// Per-layer PCIe host→device DMA transfer time (milliseconds), measured
+    /// individually per sample layer in the warm-up profiler (A3-b).
+    #[serde(default)]
+    pub pcie_transfer_ms: f32,
+}
+
+impl Default for LayerTiming {
+    fn default() -> Self {
+        Self {
+            layer_idx: 0,
+            forward_ms: 0.0,
+            backward_ms: 0.0,
+            shard_bytes: 0,
+            transfer_ms: 0.0,
+            pcie_transfer_ms: 0.0,
+        }
+    }
 }
 
 /// Hardware-profile produced by the warm-up profiler and cached to disk.

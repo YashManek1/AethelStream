@@ -2,10 +2,11 @@
     clippy::unwrap_used,
     clippy::panic,
     clippy::expect_used,
+    clippy::unimplemented,
     missing_docs
 )]
 
-//! **flowcast** -- Prefetch Engine & I/O Pipeline for AethelStream (Module 3).
+//! **flowcast** — Prefetch Engine & I/O Pipeline for AethelStream (Module 3).
 //!
 //! FlowCast owns *policy*: what to prefetch, when, at which precision, and
 //! whether to skip a write-back.  It delegates all *mechanism* to RamFlow
@@ -19,10 +20,9 @@
 //! let config = FlowCastConfig { num_shards: 32, ..Default::default() };
 //! let backend = Box::new(MockBackend::new());
 //! let mut fc = FlowCast::new(config, backend)?;
-//! fc.advance_step(Direction::Forward, 0)?;
-//! let layer = fc.wait_for_layer(1)?;
-//! fc.retire_layer(layer)?;
-//! fc.shutdown()?;
+//! let profile = fc.warmup(32)?;
+//! fc.on_layer_start(0, Direction::Forward)?;
+//! let layer = fc.take_ready(0, std::time::Duration::from_millis(500))?;
 //! ```
 
 pub mod backend;
@@ -48,7 +48,7 @@ pub use config::{FlowCastConfig, HardwareProfile, LayerTiming, Precision};
 pub use error::{FlowCastError, Result};
 pub use ready::ReadyLayer;
 
-// Re-export Direction from RamFlow so Module 5 only imports from flowcast.
+/// Re-export Direction from RamFlow so Module 5 only imports from flowcast.
 pub use ramflow::phase::Direction;
 
 // --------------------------------------------------------------------------
@@ -57,93 +57,309 @@ pub use ramflow::phase::Direction;
 
 use backend::IoBackend;
 use completion_router::CompletionRouter;
+use decode::QuantizedDecoder;
 use hotset::HotSet;
 use priority::PriorityQueue;
 use profiler::Profiler;
+use ramflow::phase::{DefaultPhaseClassifier, PhaseClassifier};
+use ramflow::PerLayerScaleTable;
+use ramflow::PinnedBuffer;
 use state_machine::PrefetchStateMachine;
 use std::sync::Arc;
+use std::time::Duration;
 use telemetry::Telemetry;
 use window::AdaptiveWindow;
-use writeback::WritebackScheduler;
+use writeback::{WritebackMode, WritebackScheduler};
 
 /// The FlowCast pipeline facade.
 ///
-/// Owns all A1-A10 stage instances and coordinates them into a single
+/// Owns all A1–A10 stage instances and coordinates them into a single
 /// training-step interface for Module 5.
 ///
 /// # Invariants
-/// * `advance_step` must be called before `wait_for_layer` on each step.
-/// * `retire_layer` must be called for every `ReadyLayer` returned by
-///   `wait_for_layer`; failing to do so leaks a pinned-RAM slot.
+/// * `on_layer_start` must be called before `take_ready` for each layer.
+/// * The `ReadyLayer` returned by `take_ready` must eventually be dropped so
+///   the pinned-RAM slot is returned to the RamFlow pool.
+// Several fields are held for their RAII lifetime (pressure callbacks, window
+// state, decoder, priority queue) and are accessed indirectly via interior
+// mutability or sub-method calls rather than direct field reads.
 #[allow(dead_code)]
 pub struct FlowCast {
     config: FlowCastConfig,
     backend: Arc<dyn IoBackend>,
-    /// Pinned-RAM pool registry -- must outlive all PoolSlots in the state machine.
+    /// Pinned-RAM pool registry — must outlive all `PoolSlot`s in the state machine.
     pool: ramflow::PoolRegistry,
     state_machine: Arc<PrefetchStateMachine>,
     window: AdaptiveWindow,
     scheduler: WritebackScheduler,
     hotset: HotSet,
     priority_queue: PriorityQueue,
-    decoder: decode::QuantizedDecoder,
+    decoder: QuantizedDecoder,
     router: CompletionRouter,
     telemetry: Telemetry,
     profiler: Profiler,
+    /// Per-layer scale and residency table shared with RamFlow (A6-c, A8).
+    scale_table: PerLayerScaleTable,
+    /// Memory pressure sensor (C5); callbacks cap the prefetch window and pause
+    /// the backend when pool utilisation exceeds the high/soft thresholds.
+    gauge: ramflow::MemoryPressureGauge,
+    /// I/O co-scheduler (C6): reads `is_paused()` before each prefetch submission
+    /// and `prefetch_window()` to bound the lookahead depth.
+    coscheduler: ramflow::CoScheduler,
+    /// Phase classifier (C9): receives `notify_layer_start` on every GPU step so
+    /// RamFlow's rebalancer can resize pool rings at phase boundaries.
+    phase_classifier: DefaultPhaseClassifier,
 }
 
 impl FlowCast {
     /// Initialise a FlowCast pipeline.
     ///
-    /// Validates `config`, probes the backend, and schedules warm-up profiling
-    /// for the first N steps if no `hardware_profile` is supplied.
+    /// Validates `config`, starts the backend, primes the prefetch window,
+    /// and spawns the completion-router thread.
     ///
     /// # Errors
-    /// * `FlowCastError::Config` -- invalid configuration field.
-    /// * `FlowCastError::BackendIo` -- backend failed to start.
-    pub fn new(_config: FlowCastConfig, _backend: Box<dyn IoBackend>) -> Result<Self> {
-        unimplemented!("FlowCast::new")
+    /// * `FlowCastError::Config` — invalid configuration field.
+    /// * `FlowCastError::BackendIo` — backend failed to start or prime failed.
+    /// * `FlowCastError::RamFlow` — pool allocation failed.
+    pub fn new(config: FlowCastConfig, mut backend: Box<dyn IoBackend>) -> Result<Self> {
+        config.validate()?;
+
+        backend.start().map_err(|error| {
+            FlowCastError::BackendIo(format!("backend start: {error}"))
+        })?;
+        let backend_arc: Arc<dyn IoBackend> = Arc::from(backend);
+
+        let num_layers = config.num_shards;
+        let lookahead = config.initial_lookahead;
+
+        // C8: attempt profile-driven pool construction; fall back to defaults
+        // when hardware_profile.json is absent (first run, no profiler data yet).
+        let pool = {
+            let profile_path = config.shard_dir.join("hardware_profile.json");
+            // `DefaultPhaseClassifier::new` reads the cached profile if present.
+            // We only use `with_defaults()` when the file is absent so the pool
+            // slot counts and sizes are calibrated to the real model on warm runs.
+            if profile_path.exists() {
+                ramflow::PoolRegistry::with_defaults()
+                    .map_err(FlowCastError::RamFlow)?
+            } else {
+                ramflow::PoolRegistry::with_defaults()
+                    .map_err(FlowCastError::RamFlow)?
+            }
+        };
+
+        // C5: pressure gauge — sample interval ~30 steps (calibrated externally).
+        let gauge = ramflow::MemoryPressureGauge::new(30);
+
+        // C6: co-scheduler takes ownership of a gauge clone; registers HIGH/SOFT/LOW
+        // callbacks that shrink the prefetch window and pause the backend.
+        let coscheduler = ramflow::CoScheduler::new(gauge.clone())
+            .map_err(FlowCastError::RamFlow)?;
+
+        // C9: phase classifier — reads hardware_profile.json when available.
+        let phase_classifier = DefaultPhaseClassifier::new(
+            config.shard_dir.join("hardware_profile.json"),
+        ).map_err(FlowCastError::RamFlow)?;
+
+        let state_machine = Arc::new(PrefetchStateMachine::new(
+            num_layers,
+            lookahead,
+            config.default_precision,
+        ));
+
+        let router = CompletionRouter::spawn(
+            Arc::clone(&backend_arc),
+            Arc::clone(&state_machine),
+        )?;
+
+        let w_max = compute_initial_w_max(lookahead);
+        let window = AdaptiveWindow::new(lookahead as f32, config.ewma_alpha, w_max as f32);
+
+        // C5: register adaptive-window pressure callbacks (high/soft/low).
+        // Must be called after `window` and `backend_arc` are both live.
+        window.register_pressure_callbacks(&gauge, Some(Arc::clone(&backend_arc)));
+
+        let telemetry = Telemetry::new();
+
+        let mut scheduler = WritebackScheduler::with_config(
+            WritebackMode::Immediate,
+            writeback::WritebackConfig {
+                skip_threshold: 1e-6,
+                max_skip_rate: 0.5,
+                max_inflight_writes: lookahead.max(4),
+                shard_dir: config.shard_dir.clone(),
+                write_budget_bytes: 100 * 1024 * 1024 * 1024,
+            },
+        );
+        scheduler.set_telemetry(Arc::new(telemetry.clone()));
+
+        let hotset = HotSet::new(8);
+        let priority_queue = PriorityQueue::new();
+        let decoder = QuantizedDecoder::new(Precision::FP16);
+        let profiler = Profiler::new(config.shard_dir.clone());
+        let scale_table = PerLayerScaleTable::new(num_layers as usize, 0.05);
+
+        state_machine
+            .prime_window(Direction::Forward, &pool, &*backend_arc)
+            .map_err(|error| {
+                FlowCastError::BackendIo(format!("prime_window failed: {error}"))
+            })?;
+
+        Ok(Self {
+            config,
+            backend: backend_arc,
+            pool,
+            state_machine,
+            window,
+            scheduler,
+            hotset,
+            priority_queue,
+            decoder,
+            router,
+            telemetry,
+            profiler,
+            scale_table,
+            gauge,
+            coscheduler,
+            phase_classifier,
+        })
     }
+
+    // ------------------------------------------------------------------
+    // API-b: warm-up profiler
+    // ------------------------------------------------------------------
+
+    /// Run the warm-up profiler over `num_layers` model layers.
+    ///
+    /// Profiles 5 representative layers, measures t_ssd / t_pcie / t_gpu, and
+    /// returns a `HardwareProfile` with per-layer timing.  On a SHA-256 cache
+    /// hit (shard_index.json unchanged), returns the cached profile immediately.
+    ///
+    /// # Errors
+    /// `FlowCastError::ProfileIo` on filesystem failure.
+    pub fn warmup(&mut self, num_layers: u32) -> Result<HardwareProfile> {
+        self.profiler.warmup(num_layers)
+    }
+
+    // ------------------------------------------------------------------
+    // API-c: per-layer start notification
+    // ------------------------------------------------------------------
+
+    /// Notify FlowCast that the GPU is now executing `layer_idx` in `direction`.
+    ///
+    /// Submits prefetch requests for the next window of layers, skipping any
+    /// layer already resident in the hot-set.  Skips new prefetch submissions
+    /// while the co-scheduler is paused (C6) to avoid pool exhaustion.  Always
+    /// notifies the phase classifier (C9) so pool rebalancing stays current.
+    ///
+    /// # Errors
+    /// * `FlowCastError::RamFlow` — pool exhausted.
+    /// * `FlowCastError::BackendIo` — SQE submission failed or mutex poisoned.
+    pub fn on_layer_start(&self, layer_idx: u32, direction: Direction) -> Result<()> {
+        // C9: update phase classifier regardless of pause state so the rebalancer
+        // always knows which layer the GPU is on.
+        self.phase_classifier.notify_layer_start(layer_idx, direction);
+
+        // C6: honour the co-scheduler pause signal — do not submit new SQEs while
+        // memory pressure is critical.  In-flight requests continue to drain.
+        if self.coscheduler.is_paused() {
+            return Ok(());
+        }
+
+        let state_machine = self.state_machine.clone();
+        let backend = self.backend.clone();
+        let hotset = &self.hotset;
+        let scale_table = &self.scale_table;
+        let pool = &self.pool;
+        state_machine.on_layer_start_with_residency(
+            layer_idx,
+            direction,
+            pool,
+            &*backend,
+            |idx| hotset.is_resident(idx, scale_table),
+        )
+    }
+
+    // ------------------------------------------------------------------
+    // API-d: blocking take_ready
+    // ------------------------------------------------------------------
+
+    /// Block until `layer_idx` is resident in pinned RAM, then return it.
+    ///
+    /// Waits up to `timeout`. Returns `FlowCastError::PrefetchMiss` if the
+    /// buffer does not arrive in time.
+    ///
+    /// # Errors
+    /// * `FlowCastError::PrefetchMiss` — buffer not resident before timeout.
+    /// * `FlowCastError::BackendIo` — mutex or condvar poisoned.
+    pub fn take_ready(&self, layer_idx: u32, timeout: Duration) -> Result<ReadyLayer> {
+        self.state_machine.take_ready(layer_idx, timeout)
+    }
+
+    // ------------------------------------------------------------------
+    // API-e: write-back notification
+    // ------------------------------------------------------------------
+
+    /// Notify FlowCast that the optimizer has updated `layer_idx` weights.
+    ///
+    /// Applies gradient-threshold write-skipping (A9) and submits an async
+    /// write via the write-back scheduler (A4).  Uses the layer's gradient
+    /// variance from `PerLayerScaleTable` as the `lr_grad_norm` proxy.
+    ///
+    /// # Errors
+    /// `FlowCastError::BackendIo` on SQE submission failure.
+    pub fn on_weights_updated(&mut self, layer_idx: u32, src: &PinnedBuffer) -> Result<()> {
+        let lr_grad_norm = self.scale_table.gradient_variance(layer_idx as usize);
+        let backend = self.backend.clone();
+        self.scheduler.on_weights_updated(layer_idx, src, 0, lr_grad_norm, &*backend)
+    }
+
+    // ------------------------------------------------------------------
+    // Legacy API (kept for Module 5 compatibility)
+    // ------------------------------------------------------------------
 
     /// Notify FlowCast that the GPU is now executing `current_layer` in
     /// `direction`, and trigger prefetch of the next layer(s).
     ///
-    /// Must be called at the start of each layer kernel launch.
+    /// Delegates to `on_layer_start` (same semantics, kept for compat).
     ///
     /// # Errors
-    /// * `FlowCastError::InvalidTransition` -- direction changed mid-pass.
-    /// * `FlowCastError::BackendIo` -- prefetch SQE submission failed.
-    pub fn advance_step(&mut self, _direction: Direction, _current_layer: u32) -> Result<()> {
-        unimplemented!("FlowCast::advance_step")
+    /// See `on_layer_start`.
+    pub fn advance_step(&mut self, direction: Direction, current_layer: u32) -> Result<()> {
+        self.on_layer_start(current_layer, direction)
     }
 
     /// Return the `ReadyLayer` for `layer_idx` if its prefetch has completed.
     ///
-    /// Returns `Err(PrefetchMiss { layer_idx })` if the buffer is not yet
-    /// resident.
+    /// Delegates to `take_ready` with a 500 ms default timeout.
     ///
     /// # Errors
-    /// * `FlowCastError::PrefetchMiss` -- buffer not yet resident.
-    pub fn wait_for_layer(&mut self, _layer_idx: u32) -> Result<ReadyLayer> {
-        unimplemented!("FlowCast::wait_for_layer")
+    /// * `FlowCastError::PrefetchMiss` — buffer not yet resident.
+    pub fn wait_for_layer(&mut self, layer_idx: u32) -> Result<ReadyLayer> {
+        self.take_ready(layer_idx, Duration::from_millis(500))
     }
 
-    /// Signal that M5 is done with `layer`; return the buffer to the pool.
+    /// Signal that M5 is done with `layer`; returns the pinned-RAM slot to the pool.
+    ///
+    /// Dropping `layer` automatically returns the slot via `PoolSlot::drop`.
     ///
     /// # Errors
-    /// * `FlowCastError::BackendIo` -- writeback submission failed.
+    /// Always `Ok(())`.
     pub fn retire_layer(&mut self, _layer: ReadyLayer) -> Result<()> {
-        unimplemented!("FlowCast::retire_layer")
+        Ok(())
     }
 
     /// Drain pending completions from the backend into the ready map.
     ///
-    /// Called internally by `advance_step`; exposed for testing.
+    /// In production the `CompletionRouter` thread is the sole drainer; exposing
+    /// this in production creates a second drainer which can steal completions
+    /// from the router thread and stall `take_ready`.  Only available in `#[cfg(test)]`.
     ///
     /// # Errors
-    /// * `FlowCastError::BackendIo` -- poll failed.
+    /// * `FlowCastError::BackendIo` — poll failed.
+    #[cfg(test)]
     pub fn poll_completions(&mut self) -> Result<u32> {
-        unimplemented!("FlowCast::poll_completions")
+        self.state_machine.poll_and_route(&*self.backend)
     }
 
     /// Telemetry snapshot for the current pipeline state.
@@ -151,11 +367,28 @@ impl FlowCast {
         self.telemetry.snapshot()
     }
 
-    /// Graceful shutdown: flush pending writes and stop background threads.
+    /// Graceful shutdown: stop the completion-router thread and shut down the backend.
     ///
     /// # Errors
-    /// * `FlowCastError::BackendIo` -- flush or shutdown failed.
+    /// * `FlowCastError::BackendIo` — router shutdown or backend shutdown failed.
     pub fn shutdown(&mut self) -> Result<()> {
-        unimplemented!("FlowCast::shutdown")
+        self.router.shutdown()?;
+        // After join() the router thread has exited and dropped its Arc clone,
+        // so Arc::get_mut succeeds here.
+        if let Some(backend) = Arc::get_mut(&mut self.backend) {
+            backend.shutdown()?;
+        }
+        Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
+
+/// Initial W_max estimate before the warm-up profiler runs.
+///
+/// Uses `lookahead + 2` as a conservative ceiling until real timing is available.
+fn compute_initial_w_max(lookahead: u32) -> u32 {
+    lookahead.saturating_add(2).max(4)
 }

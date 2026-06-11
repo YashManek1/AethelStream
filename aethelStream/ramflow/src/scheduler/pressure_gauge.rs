@@ -62,6 +62,8 @@ pub(crate) struct GaugeInner {
 
     /// Signals the background thread to exit on its next wake.
     pub(crate) shutdown: AtomicBool,
+    /// Background sampler thread handle stored so Drop can join it.
+    thread_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl GaugeInner {
@@ -103,6 +105,18 @@ impl GaugeInner {
     }
 }
 
+impl Drop for GaugeInner {
+    fn drop(&mut self) {
+        // Signal first so the thread wakes on its next check.
+        self.shutdown.store(true, std::sync::atomic::Ordering::Release);
+        if let Ok(mut guard) = self.thread_handle.lock() {
+            if let Some(handle) = guard.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // MemoryPressureGauge
 // ---------------------------------------------------------------------------
@@ -139,6 +153,7 @@ impl MemoryPressureGauge {
                 low_threshold: 0.40,
                 sample_interval_steps: sample_interval,
                 shutdown: AtomicBool::new(false),
+                thread_handle: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -214,7 +229,7 @@ impl MemoryPressureGauge {
     /// Returns `Err(IoUringError)` if the OS rejects the spawn.
     pub fn start(&self, registry: Arc<crate::pool::PoolRegistry>) -> crate::Result<()> {
         let inner = Arc::clone(&self.inner);
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("ramflow-pressure-sampler".into())
             .spawn(move || loop {
                 if inner.shutdown.load(Acquire) {
@@ -227,6 +242,11 @@ impl MemoryPressureGauge {
                 inner.compute_and_fire(&registry);
             })
             .map_err(crate::RamFlowError::IoUringError)?;
+        self.inner
+            .thread_handle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .replace(handle);
         Ok(())
     }
 

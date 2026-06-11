@@ -1,9 +1,9 @@
 # RamFlow: System Memory Orchestration for AethelStream
 ## Full Technical Report — Module 2 Reference Document
 
-**Version:** Post-Sprint 6 (complete)  
-**Date:** 2026-06-10  
-**Test status:** 77 passing / 0 failing (mock-cuda + ssd-wear), 75 passing / 0 failing (mock-cuda only)  
+**Version:** Post-Phase 1 Audit Hardening (complete)  
+**Date:** 2026-06-11  
+**Test status:** 82 passing / 0 failing (mock-cuda + ssd-wear), 0 failing (mock-cuda only)  
 **Clippy:** 0 warnings, 0 errors (`-D warnings`)
 
 ---
@@ -146,7 +146,7 @@ Drop::drop():
 ```
 Reversing this is silent UB: the OS can reuse the physical pages immediately after `free`, then `cudaHostUnregister` dereferences the now-invalid physical address, corrupting the next allocation.
 
-**INT8 compression flag:** `compressed: bool` tracks whether the buffer content has been quantized by the `compress_checkpoint_fp16_to_int8` kernel. Module 5 checks `buf.is_compressed()` before reading gradient checkpoint data.
+**INT8 compression flag:** `compressed: bool` tracks whether the buffer content has been quantized by the `compress_checkpoint_fp16_to_int8` kernel. Module 5 checks `buf.is_compressed()` before reading gradient checkpoint data. **Caller obligation:** after `compress_checkpoint_fp16_to_int8` returns `Ok(())`, the caller must immediately call `buf.set_compressed(true)` — the kernel does not set the flag itself, to keep kernel logic free of Rust object references.
 
 **Platform support:** Linux (`posix_memalign` + `libc::free`), Windows (`_aligned_malloc` + `_aligned_free`), fallback (`std::alloc::Layout`).
 
@@ -171,6 +171,8 @@ embed_slot_bytes   = max(zero_copy_threshold / 4, 512)
 ```
 
 The zero-copy threshold is measured at startup by `WarmupProfiler::measure_zero_copy_crossover()`. In the mock estimator it is 4 MiB, giving 2 MiB attention/MLP slots.
+
+**Threshold wiring:** `PoolRegistry::new()` now calls `ZeroCopyRouter::set_threshold(zero_copy_threshold)` immediately after the non-zero threshold guard, propagating the hardware-profiled crossover to the global `ZeroCopyRouter` singleton. Before this fix, every `ZeroCopyRouter::route()` call used the default 4 MiB constant regardless of what the profiler measured.
 
 **Pre-flight budget check:** Before any allocation, `preflight_profile_memory_budget()` estimates:
 ```
@@ -211,7 +213,7 @@ Wraps the `io-uring` crate (pinned to v0.7.11) into a two-mode ring:
 
 SQPOLL parameters: idle timeout = 2000 ms (kernel thread sleeps after 2 s of no submissions, wakes on next push).
 
-Ring geometry: 128 SQEs / 256 CQEs. 256 CQEs = 2× the SQ depth, preventing CQ overflow when completions arrive faster than the poller drains them.
+Ring geometry: `sq_entries = 128`, `cq_entries = 256`. 256 CQEs = 2× the SQ depth, preventing CQ overflow when completions arrive faster than the poller drains them. Both the SQPOLL and standard `IoUring::builder()` chains now call `.setup_cqe_size(params.cq_entries)` to pass this value to the kernel — previously `cq_entries` was declared in `IoUringParams` but never forwarded to the kernel, which used its own heuristic sizing.
 
 Two API variants at compile time:
 - Default: `submission_shared()` / `completion_shared()` — lowest overhead, no internal lock.
@@ -235,7 +237,7 @@ byte_offset mod 512 == 0
 length      mod 512 == 0
 buffer_ptr  mod 512 == 0
 ```
-PinnedBuffer satisfies the third constraint by construction (512-byte alignment from `posix_memalign`).
+PinnedBuffer satisfies the third constraint by construction (512-byte alignment from `posix_memalign`). The `DIRECT_IO_ALIGNMENT = 512` constant in `prefetch.rs` carries an explicit doc cross-reference to `PINNED_ALIGN = 512` in `allocator::pinned`, making the co-dependence auditable without tracing through two files.
 
 **Pressure gate** (`check_pause()`):
 ```
@@ -248,9 +250,11 @@ if outstanding_reads + claimed_slots > pressure_threshold  →  Err(PressurePaus
 - Stack: 256 KiB
 - Pinned to `cpu_core` via `pthread_setaffinity_np` (prevents 10–100 µs cache-miss penalty from thread migration)
 - Poll interval: 1 ms `wait_for_cqe_timeout` (short enough for frequent stop-signal checks; long enough to avoid busy-polling)
-- On completion: sends `CqeResult { token, result }` on bounded channel (capacity 1024 = 4× CQ ring depth)
+- On completion: sends `CqeResult { token, result }` on bounded channel (capacity `COMPLETION_CHANNEL_CAPACITY = 4 * CQ_DEPTH = 1024` — derived from the ring constant, not hardcoded)
 
 **Super-shard grouped I/O:** When consecutive layers share a single contiguous shard file region, `schedule_super_shard` submits one read for the entire group. This reduces SQE count from O(layers × tensors) to O(groups). Disabled by default until the WarmupProfiler measures a layout where grouping wins.
+
+When enabled, `schedule_super_shard` validates that every entry in the `layer_offsets` slice satisfies `offset < length` before submitting the merged SQE. An out-of-range offset returns `Err(RamFlowError::ConfigError(...))` with the offending index, value, and shard ID. The `layer_offsets` parameter is relative to `byte_offset`; the caller uses it to demultiplex individual layers out of the merged destination buffer after completion.
 
 #### 3.3.4 WriteBudgetManager (`write_budget.rs`, `ssd-wear` feature)
 
@@ -290,6 +294,8 @@ Recomputation{ window_start: u32, window_end: u32 }
 - Peak simultaneous attention slot claims per phase (Forward: 1, Backward: 2, Recomputation: 3 in the integration test)
 - Zero-copy crossover threshold (mock: 4 MiB)
 - Writes `hardware_profile.json` to the configured output path
+
+**SHA-256 cache invalidation:** `WarmupConfig::for_shard_index(path)` reads the shard index file and computes its SHA-256 hash at construction time. On subsequent runs, `load_cached_profiles()` compares this hash against the stored profile; a mismatch (model changed) skips the cache and re-profiles. The hash is never a zero-filled dummy — it is always derived from the file bytes, so a profile produced for one model checkpoint is never silently reused for a different one.
 
 **PhaseRebalancer** acquires a "phase fence" (spin-wait until `total_claimed_slots == 0 && outstanding_cuda_copies == 0`) before resizing rings. Timeout configurable via `RAMFLOW_PHASE_FENCE_TIMEOUT_MS` in debug builds (default 30 s in release).
 
@@ -333,7 +339,7 @@ Registers three callbacks at construction:
 
 `AcqRel` on the window atomics ensures prior writes in the callback's thread are visible to the next thread that reads the decremented window (prevents ARM/RISC-V memory-ordering hazards).
 
-`should_compress_checkpoints()` returns `compress_trigger.load(Acquire)`. Module 5 checks this on each backward step to decide whether to compress activation checkpoints to INT8 before the next layer streams in.
+**`should_compress_checkpoints() -> bool`** — public reader for `compress_trigger`. Returns `compress_trigger.load(Acquire)`, observing the `Release` store from the soft-pressure callback. Module 5 calls this at the start of each backward step; a `true` return triggers `compress_checkpoint_fp16_to_int8` on the next activation checkpoint before the layer streams back in. Before this method existed, `compress_trigger` had no public reader, making the soft-pressure band's effect unobservable outside the scheduler subsystem.
 
 ---
 
@@ -365,7 +371,7 @@ scales[c] = (channel_max > 0) ? channel_max / 127.0 : 1.0
 q = clamp(__float2int_rn(src[c][i] / scales[c]), -128, 127)
 dst[c][i] = (int8_t)q
 ```
-Uses `__float2int_rn` (round-to-nearest-even, IEEE 754) for consistency with the Rust simulation.
+Uses `__float2int_rn` (round-to-nearest-even, IEEE 754). The Rust mock `mock_compress_checkpoint` replicates this via `round_half_to_even(x)` — a private helper that rounds ties toward the even integer, matching CUDA semantics exactly. Previously the mock used `f32::round()` (round-half-away-from-zero), which diverges from `__float2int_rn` on exact half-values (e.g., 2.5 → 3 vs 2); this divergence would have caused phantom test failures on tie inputs during gradient parity testing.
 
 **`decompress_int8_to_fp16`:**
 ```
@@ -373,6 +379,18 @@ dst[c][i] = __float2half((float)src[c][i] * scales[c])
 ```
 
 **Expected quantization error:** < 0.1% gradient deviation for typical post-LayerNorm activations (verified in Test 12 below).
+
+**Packed buffer layout helper:** `split_compressed_buffer_ptrs(base: *mut u8, n_channels: usize) -> Result<(*mut f32, *mut i8)>` is an `unsafe fn` that derives the two sub-pointers from a single `PinnedBuffer` base pointer for callers that allocate one buffer for the full compressed checkpoint:
+
+```
+┌──────────────────────────────────┬───────────────────────────────────┐
+│  n_channels × sizeof(f32)        │  n_channels × elems_per_channel   │
+│  per-channel scale factors (f32) │  × sizeof(i8)  quantised values   │
+└──────────────────────────────────┴───────────────────────────────────┘
+^─── base ptr (512-byte aligned) ─────────────────────────────────────^
+```
+
+Returns `Err(ConfigError)` if `n_channels == 0`. Marked `unsafe` because it performs raw pointer arithmetic; callers must ensure `base` points to a sufficiently large, correctly aligned buffer.
 
 ---
 
@@ -419,11 +437,13 @@ else:
     route = Dma       # cudaMemcpyAsync
 ```
 
+**Safety guard:** `device_pointer_for_mapped_buffer()` — the internal helper that calls `cudaHostGetDevicePointer` — now checks `buf.is_mapped()` before the FFI call and returns `Err(RamFlowError::ConfigError("..."))` if the buffer was not registered with `cudaHostRegisterMapped`. Previously the check was absent; passing an unmapped buffer produced a CUDA error that bypassed Rust's type-safe error path.
+
 **Implications:**
 - Small tensors (LayerNorm weights, bias vectors, small attention bias) use zero-copy, saving a full DMA staging copy.
 - Large tensors (QKV projections, MLP weights) always use DMA, where bandwidth is the bottleneck.
 
-**Test coverage:** `test_zero_copy.rs` — 4 tests verify routing decisions for mapped/unmapped buffers above and below threshold.
+**Test coverage:** `test_zero_copy.rs` — 4 external tests; 2 additional in-module tests in `cuda_bridge/zero_copy.rs`. All 6 cover the full 2×2 matrix: {mapped, unmapped} × {below threshold, above threshold}.
 
 ### Algorithm 3: FP16 Overflow Density Tracking (PerLayerScaleTable)
 
@@ -452,7 +472,9 @@ elif density[l] < overflow_low_threshold (0.0001) AND scale[l] < 65536.0:
 
 **Convergence (measured):** With α = 0.05 and constant 3% overflow (300/10,000 elements), density converges to 0.030 ± 10% after 100 steps. Measured directly in the integration test.
 
-**Test coverage:** Tests 8, 9 in `test_pressure_scheduler.rs`; NaN injection section of `integration.rs`.
+**Error-returning API:** `update(layer_idx, n_total, n_overflow)` returns `Result<(), RamFlowError>` and `get_scale(layer_idx)` returns `Result<f32, RamFlowError>`. Both return `Err(RamFlowError::ConfigError(...))` if `layer_idx ≥ table_length`, with a message naming the index and the table length. Previously both silently returned (update: early return, get_scale: `unwrap_or(1.0)`) on out-of-bounds access, making configuration errors invisible. `get_density(layer_idx)` follows the same contract.
+
+**Test coverage:** Tests 8, 9 in `test_pressure_scheduler.rs`; NaN injection section of `integration.rs` and `flowcast/tests/integration.rs`.
 
 ### Algorithm 4: Memory/I/O Co-Scheduler with Pressure Feedback
 
@@ -508,7 +530,7 @@ dst[c][i] = (float)src[c][i] * scale[c]   →   __half
 ```
 [n_channels × sizeof(float32) scale factors] || [n_elements × int8_t]
 ```
-The `PinnedBuffer::compressed` flag signals this layout. Module 5 checks `buf.is_compressed()` before reading checkpoint data and calls `decompress_checkpoint_int8_to_fp16` if true.
+The `PinnedBuffer::compressed` flag signals this layout. Module 5 checks `buf.is_compressed()` before reading checkpoint data and calls `decompress_checkpoint_int8_to_fp16` if true. Use `split_compressed_buffer_ptrs(buf.as_mut_ptr(), n_channels)` to derive the `scales_device` and `data_device` pointers from a single `PinnedBuffer` allocation (see Section 3.6 above).
 
 **Trigger condition:** `CoScheduler::should_compress_checkpoints()` returns `compress_trigger.load(Acquire)`, which is set by the soft-pressure callback and cleared by the low-pressure callback.
 
@@ -535,32 +557,44 @@ The `PinnedBuffer::compressed` flag signals this layout. Module 5 checks `buf.is
 
 | Feature set | Active tests | Ignored | Failures |
 |-------------|-------------|---------|----------|
-| `--features mock-cuda` | 75 | 7 | 0 |
-| `--features mock-cuda,ssd-wear` | 77 | 7 | 0 |
+| `--features mock-cuda` | 78 | 7 | 0 |
+| `--features mock-cuda,ssd-wear` | 82 | 7 | 0 |
 
 **Test breakdown by module:**
 
 | File | Tests | Coverage |
 |------|-------|---------|
-| `src/` lib tests | 39 | Allocator, pool, scheduler, kernels, phase |
-| `tests/integration.rs` | 1 | Full 2-cycle streaming, pressure, NaN injection, VmRSS |
+| `src/` lib tests (incl. zero_copy in-module) | 42 | Allocator, pool, scheduler, kernels, phase, zero-copy routing |
+| `tests/integration.rs` | 3 | Full 2-cycle streaming, pressure, NaN injection, VmRSS lower-bound (Linux), profiler SHA-256 + cache-skip |
 | `tests/test_io_uring.rs` | 18 (+ 1 ignored Linux-only) | io_uring SQE/CQE, alignment, fallback |
 | `tests/test_phase_classifier.rs` | 1 | Phase transition classification |
 | `tests/test_pool_exhaustion.rs` | 2 | Slow path, double-issue guard |
 | `tests/test_pressure_scheduler.rs` | 2 | Pressure gauge + CoScheduler |
-| `tests/test_write_budget.rs` | 1–3 (feature-dependent) | Delta compress, ssd-wear strategies |
-| `tests/test_zero_copy.rs` | 4 | Zero-copy routing |
+| `tests/test_write_budget.rs` | 4 (ssd-wear), 0 (mock-cuda only) | Delta compress wrapping round-trip, ssd-wear strategies, INT8 fidelity |
+| `tests/test_zero_copy.rs` | 4 | Zero-copy routing (external harness) |
 | Doc tests | 3 ignored (Linux-only) | — |
+
+**New tests added in Phase 1 audit hardening:**
+
+| Test | File | Finding |
+|------|------|---------|
+| `mock_rounding_matches_cuda_float2int_rn_on_tie_values` | `src/kernels/mod.rs` | M2-9f |
+| `mapped_large_buffer_above_threshold_routes_to_dma` | `src/cuda_bridge/zero_copy.rs` | M2-3d |
+| `unmapped_large_buffer_above_threshold_routes_to_dma` | `src/cuda_bridge/zero_copy.rs` | M2-3d |
+| `pinned_alloc_vmrss_grows_by_approximately_requested_size` (Linux) | `tests/integration.rs` | M2-1b |
+| `warmup_profiler_sha256_nonzero_and_second_run_uses_cache` | `tests/integration.rs` | M2-2e |
+| `compress_delta_wrapping_sub_and_decompress_is_bitexact_round_trip` | `tests/test_write_budget.rs` | M2-8c |
 
 ### 5.3 Code Quality Gates
 
 | Gate | Status |
 |------|--------|
 | `#![deny(clippy::unwrap_used, clippy::panic, clippy::expect_used)]` | Enforced in `lib.rs` |
-| `cargo clippy --no-default-features --features mock-cuda -- -D warnings` | 0 warnings, 0 errors |
+| `cargo clippy --no-default-features --features "mock-cuda ssd-wear" -- -D warnings` | 0 warnings, 0 errors |
 | Zero `unwrap()/expect()/panic!()` in non-test production code | Verified |
 | Full `rustdoc` on all public types and functions | Complete |
-| `# Safety` sections on all `unsafe fn` | Complete |
+| `# Safety` sections on all `unsafe fn` | Complete — including new `split_compressed_buffer_ptrs` |
+| `clippy::not_unsafe_ptr_arg_deref` | `split_compressed_buffer_ptrs` marked `unsafe fn` as required |
 
 ### 5.4 Memory Alignment Properties
 
@@ -937,7 +971,26 @@ use ramflow::phase::{TrainingPhase, Direction, PhaseClassifier, WarmupProfiler};
 use ramflow::nvme::write_budget::{WriteBudgetManager, WriteStrategy};
 use ramflow::kernels::{fused_overflow_check, count_overflow_fp16,
                        compress_checkpoint_fp16_to_int8,
-                       decompress_checkpoint_int8_to_fp16};
+                       decompress_checkpoint_int8_to_fp16,
+                       split_compressed_buffer_ptrs};  // unsafe: packed buffer ptr derivation
+```
+
+**Changed signatures (Phase 1 audit hardening):**
+```rust
+// PerLayerScaleTable — all three methods now return Result
+impl PerLayerScaleTable {
+    pub fn update(&mut self, layer_idx: usize, n_total: u64, n_overflow: u32)
+        -> Result<(), RamFlowError>;           // Err on layer_idx >= table_len
+    pub fn get_scale(&self, layer_idx: usize)
+        -> Result<f32, RamFlowError>;          // Err on layer_idx >= table_len
+    pub fn get_density(&self, layer_idx: usize)
+        -> Result<f32, RamFlowError>;          // Err on layer_idx >= table_len
+}
+
+// CoScheduler — new reader for compress_trigger
+impl CoScheduler {
+    pub fn should_compress_checkpoints(&self) -> bool;  // Acquire load
+}
 ```
 
 **Key invariants callers must uphold:**
@@ -945,9 +998,10 @@ use ramflow::kernels::{fused_overflow_check, count_overflow_fp16,
 2. All shard file byte offsets must be 512-byte aligned (Module 1 enforces at shard creation).
 3. `PoolRegistry::set_pressure_gauge(gauge)` must be called before the training loop starts.
 4. `PhaseRebalancer::rebalance_to_profile()` must only be called when all slots are free (the fence enforces this internally but callers should not force a timeout by holding slots across a rebalance).
-5. `PinnedBuffer::set_compressed(true)` must be called immediately after `compress_checkpoint_fp16_to_int8` returns, before any other code reads the buffer.
+5. `PinnedBuffer::set_compressed(true)` must be called immediately after `compress_checkpoint_fp16_to_int8` returns `Ok(())`, before any other code reads the buffer.
+6. `split_compressed_buffer_ptrs` is `unsafe` — callers must guarantee the base pointer is valid for `n_channels * 4 + n_elements` bytes, 512-byte aligned, and that the pointed-to buffer is not concurrently mutated.
 
 ---
 
 *RamFlow Module 2 — AethelStream research project*  
-*All tests pass. 0 clippy warnings. Public API frozen.*
+*82 tests pass. 0 clippy warnings. Public API frozen (Phase 1 audit hardening complete 2026-06-11).*

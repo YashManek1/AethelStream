@@ -24,6 +24,9 @@ pub mod io_uring_setup;
 pub mod prefetch;
 /// SSD wear-budget manager with delta compression (feature `ssd-wear`).
 pub mod write_budget;
+/// NVMe block-layer bypass via IORING_OP_URING_CMD (feature `nvme-passthrough`).
+#[cfg(feature = "nvme-passthrough")]
+pub mod passthrough;
 
 pub use engine::DirectNvmeEngine;
 
@@ -32,6 +35,14 @@ mod engine {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::{self, Receiver, SyncSender};
     use std::sync::{Arc, Mutex};
+
+    /// Number of completion queue entries — 2× SQ depth per io_uring convention.
+    const CQ_DEPTH: usize = 256;
+
+    /// Completion channel capacity: 4× CQ depth gives ~1 s of headroom at peak CQE rate
+    /// before the training loop must drain the channel.  Derived from CQ_DEPTH so a
+    /// single constant (CQ_DEPTH = 256) governs both the io_uring ring and this channel.
+    const COMPLETION_CHANNEL_CAPACITY: usize = 4 * CQ_DEPTH; // 4 * CQ_DEPTH
 
     use crate::allocator::PinnedBuffer;
     use crate::error::RamFlowError;
@@ -149,10 +160,12 @@ mod engine {
             // --- Completion channel ---
             // Bounded to ring size: prevents the poller from racing far ahead
             // of the consumer. If full, the poller blocks (back-pressure).
-            // Channel capacity must exceed the CQ ring size (256 entries) so the
+            // Channel capacity must exceed the CQ ring size (CQ_DEPTH entries) so the
             // CQE poller can never block waiting for the consumer to drain.
-            // 1024 provides 4× headroom above the 256-entry CQ ring.
-            let (completion_tx, completion_rx) = mpsc::sync_channel::<CqeResult>(1024);
+            // COMPLETION_CHANNEL_CAPACITY = 4 × CQ_DEPTH provides ~1 s of headroom
+            // at peak CQE rate before the training loop must drain the channel.
+            let (completion_tx, completion_rx) =
+                mpsc::sync_channel::<CqeResult>(COMPLETION_CHANNEL_CAPACITY);
 
             // --- Pause signal ---
             let pause_signal = Arc::new(AtomicBool::new(false));

@@ -337,6 +337,62 @@ impl PinnedBuffer {
     }
 
     // -----------------------------------------------------------------------
+    // Page-aligned allocation for NVMe PRP mode
+    // -----------------------------------------------------------------------
+
+    /// Allocate `bytes` of pinned memory aligned to 4096 bytes (one OS page).
+    ///
+    /// NVMe passthrough (`IORING_OP_URING_CMD`) uses PRP (Physical Region Page)
+    /// mode for DMA. PRP requires the data buffer address to be page-aligned
+    /// (4096 bytes). `PinnedBuffer::alloc()` guarantees only 512-byte alignment
+    /// (sufficient for O_DIRECT, but **not** for PRP).
+    ///
+    /// Use this allocator for buffers passed to `NvmePassthroughEngine::prefetch()`.
+    /// All other callers should use `PinnedBuffer::alloc()` — `PINNED_ALIGN` (512)
+    /// is intentionally kept at 512 so O_DIRECT buffers do not carry page overhead.
+    ///
+    /// # Errors
+    /// Same as [`PinnedBuffer::alloc`]: `AllocationFailed` or `CudaError`.
+    pub fn alloc_page_aligned(bytes: usize) -> Result<Self> {
+        const PAGE_ALIGN: usize = 4096;
+
+        if bytes == 0 {
+            return Err(RamFlowError::AllocationFailed(
+                "zero-size page-aligned PinnedBuffer requested".into(),
+            ));
+        }
+
+        let ptr = platform::allocate_aligned(bytes, PAGE_ALIGN)?;
+
+        // SAFETY: ptr is non-null, aligned to PAGE_ALIGN bytes, allocated by the
+        // platform allocator, and `bytes` matches the allocation size.
+        unsafe {
+            cuda_host_register(ptr as *mut c_void, bytes, CUDA_HOST_REGISTER_DEFAULT)
+                .inspect_err(|_| {
+                    // SAFETY: ptr was returned by allocate_aligned.
+                    platform::free_aligned(ptr);
+                })?;
+        }
+
+        Ok(Self {
+            ptr,
+            size_bytes: bytes,
+            is_mapped: false,
+            compressed: false,
+        })
+    }
+
+    /// Returns `true` if the buffer address is page-aligned (4096-byte boundary).
+    ///
+    /// NVMe passthrough requires page-aligned buffers for PRP mode.
+    /// `NvmePassthroughEngine::prefetch()` checks this and falls back to O_DIRECT
+    /// when the buffer was allocated with the standard `PinnedBuffer::alloc()`.
+    #[inline]
+    pub fn is_page_aligned(&self) -> bool {
+        (self.ptr as usize).is_multiple_of(4096)
+    }
+
+    // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
@@ -415,7 +471,7 @@ impl PinnedBuffer {
     /// # Safety
     /// SAFETY note for the implementation: `ptr` is valid, properly aligned,
     /// and initialized (posix_memalign allocates writable memory; it is the
-    /// caller's responsibility to write before reading, as with any Vec<u8>).
+    /// caller's responsibility to write before reading, as with any `Vec<u8>`).
     pub fn as_slice(&self) -> &[u8] {
         // SAFETY: ptr is non-null, properly aligned, valid for `size_bytes`
         // reads.  The lifetime is tied to `&self`, which prevents the buffer

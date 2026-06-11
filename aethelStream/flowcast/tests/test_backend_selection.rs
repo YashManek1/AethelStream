@@ -95,3 +95,43 @@ fn super_shard_backend_capabilities() {
     assert!(ss.capabilities().supports_super_shard);
     assert_eq!(ss.capabilities().name, "super-shard");
 }
+
+// T6-8: SuperShard coalesces pending prefetches into a group, flushes, and records
+// per-shard offsets. Completions must appear only after the group threshold is met (A5-g).
+#[test]
+fn super_shard_coalesces_group_and_records_offsets() {
+    use flowcast::backend::super_shard::{SuperShardBackend, SuperShardConfig};
+
+    let base = Box::new(MockBackend::new());
+    let config = SuperShardConfig { group_size: 2, ..SuperShardConfig::default() };
+    let ss = SuperShardBackend::new(base, config);
+
+    let buf = PinnedBuffer::alloc(128).expect("alloc");
+
+    // First prefetch: pending=[shard 0], below group_size=2 → no flush yet.
+    ss.prefetch(0, 0, 64, &buf, 1).expect("prefetch shard 0");
+    let before_flush = ss.poll_completions().expect("poll before flush");
+    assert!(
+        before_flush.is_empty(),
+        "no completion expected before group_size is reached (got {})",
+        before_flush.len()
+    );
+
+    // Second prefetch: pending=[shard 0, shard 1] → group_size reached → flush_group fires.
+    ss.prefetch(1, 64, 64, &buf, 2).expect("prefetch shard 1");
+    let after_flush = ss.poll_completions().expect("poll after group flush");
+    assert_eq!(after_flush.len(), 2, "both shards must complete after group flush");
+    assert!(
+        after_flush.iter().all(|c| c.result >= 0),
+        "all completions must succeed (no I/O error)"
+    );
+    // Byte count: mock backend echoes length as result.
+    assert!(
+        after_flush.iter().all(|c| c.result == 64),
+        "each shard result must equal its requested length (64)"
+    );
+
+    // Layer offsets must be recorded after flush_group.
+    assert_eq!(ss.layer_offset(0), Some(0), "shard 0 offset must be 0");
+    assert_eq!(ss.layer_offset(1), Some(64), "shard 1 offset must be 64");
+}

@@ -191,12 +191,24 @@ impl WarmupProfiler {
     }
 
     fn write_profiles(&self, profiles: &[PhaseMemoryProfile; 3]) -> Result<()> {
+        // Probe passthrough capability to write the field into the profile.
+        // The probe is cheap (open + ioctl + close); done once at warm-up.
+        // PassthroughCapability::Available only exists on Linux; guard the pattern.
+        #[cfg(all(feature = "nvme-passthrough", target_os = "linux"))]
+        let nvme_passthrough = matches!(
+            crate::nvme::passthrough::probe_passthrough_capability(),
+            crate::nvme::passthrough::PassthroughCapability::Available { .. }
+        );
+        #[cfg(not(all(feature = "nvme-passthrough", target_os = "linux")))]
+        let nvme_passthrough = false;
+
         let cache = HardwareProfileCache {
             model_sha256: hex_encode(&self.config.model_sha256),
             zero_copy_threshold_bytes: self.measure_zero_copy_crossover()?,
             forward: CachedPhaseProfile::from_profile(&profiles[0]),
             backward: CachedPhaseProfile::from_profile(&profiles[1]),
             recomputation: CachedPhaseProfile::from_profile(&profiles[2]),
+            nvme_passthrough,
         };
         let json = serde_json::to_vec_pretty(&cache).map_err(|serialize_error| {
             RamFlowError::ConfigError(format!(
@@ -337,6 +349,11 @@ struct HardwareProfileCache {
     forward: CachedPhaseProfile,
     backward: CachedPhaseProfile,
     recomputation: CachedPhaseProfile,
+    /// Written by the warm-up probe (feature `nvme-passthrough`).
+    /// `true` when IORING_OP_URING_CMD + NVMe char device are available.
+    /// Defaults to `false` when loading profiles written before this field existed.
+    #[serde(default)]
+    nvme_passthrough: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

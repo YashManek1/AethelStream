@@ -25,6 +25,12 @@ ssd-wear  = ["dep:zstd"]
 # this at compile time.
 cuda      = ["dep:io-uring"]
 
+# NVMe block-layer bypass via IORING_OP_URING_CMD (kernel >= 6.0).
+# Requires `io-uring` (enabled automatically on Linux). Falls back to the
+# standard O_DIRECT path when the kernel or character device is unavailable.
+# Compatible with both `cuda` and `mock-cuda`.
+nvme-passthrough = ["dep:io-uring"]
+
 # Use io_uring::split() fallback path instead of shared queue API.
 # Keep this off for best performance; enable for compatibility/debugging.
 io-uring-use-split = []

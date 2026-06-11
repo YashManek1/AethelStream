@@ -45,6 +45,9 @@ pub struct TelemetrySnapshot {
     pub write_skip_count: u64,
     /// Total write SQEs submitted.
     pub write_submitted: u64,
+    /// Instantaneous NVMe read throughput (MB/s), populated by
+    /// `Telemetry::record_nvme_throughput_mbps` (T-a fix).
+    pub nvme_throughput_mbps: f32,
 }
 
 impl TelemetrySnapshot {
@@ -107,6 +110,8 @@ pub struct Telemetry {
     decode_ns: Arc<AtomicU64>,
     write_skip_count: Arc<AtomicU64>,
     write_submitted: Arc<AtomicU64>,
+    /// Instantaneous NVMe throughput stored as f32 bits (T-a fix).
+    nvme_throughput_mbps_bits: Arc<std::sync::atomic::AtomicU32>,
     /// Timestamp of the last `on_layer_start` call (for idle-gap measurement).
     last_layer_start: Arc<std::sync::Mutex<Option<Instant>>>,
 }
@@ -130,8 +135,17 @@ impl Telemetry {
             decode_ns: Arc::new(AtomicU64::new(0)),
             write_skip_count: Arc::new(AtomicU64::new(0)),
             write_submitted: Arc::new(AtomicU64::new(0)),
+            nvme_throughput_mbps_bits: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             last_layer_start: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Record the current instantaneous NVMe read throughput (T-a fix).
+    ///
+    /// Called by the completion router after each batch to update the gauge.
+    pub fn record_nvme_throughput_mbps(&self, mbps: f32) {
+        self.nvme_throughput_mbps_bits
+            .store(mbps.to_bits(), Ordering::Relaxed);
     }
 
     /// Record a submitted prefetch SQE of `byte_length` bytes.
@@ -232,6 +246,9 @@ impl Telemetry {
             decode_ns: self.decode_ns.load(Ordering::Relaxed),
             write_skip_count: self.write_skip_count.load(Ordering::Relaxed),
             write_submitted: self.write_submitted.load(Ordering::Relaxed),
+            nvme_throughput_mbps: f32::from_bits(
+                self.nvme_throughput_mbps_bits.load(Ordering::Relaxed),
+            ),
         }
     }
 }

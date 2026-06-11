@@ -74,10 +74,9 @@ pub const CUDA_MEMCPY_HOST_TO_DEVICE: u32 = 1;
 // REAL CUDA path
 // ===========================================================================
 
-/// Link the CUDA runtime functions when building with the real GPU.
-///
-/// `cuda_host_register` pins CPU memory so the GPU's DMA engine can reach it.
-/// `cuda_host_unregister` releases that pin — must happen BEFORE `libc::free`.
+// Link the CUDA runtime functions when building with the real GPU.
+// `cuda_host_register` pins CPU memory so the GPU's DMA engine can reach it.
+// `cuda_host_unregister` releases that pin — must happen BEFORE `libc::free`.
 #[cfg(not(feature = "mock-cuda"))]
 extern "C" {
     /// Pin `size` bytes starting at `ptr` for GPU DMA access.
@@ -133,9 +132,13 @@ extern "C" {
 /// meaningful even on CI.
 /// Named with camelCase to match the CUDA runtime symbol exactly.
 ///
+/// Mock `cudaHostRegister`: register host memory for pinned DMA access.
+///
+/// Named with camelCase to match the CUDA runtime symbol exactly.
+///
 /// # Safety
-/// Caller must ensure `_ptr` was allocated by the platform aligned allocator
-/// and `_size` matches the allocation.  In mock mode this is a no-op.
+/// `_ptr` must have been allocated by the platform aligned allocator and
+/// `_size` must match the allocation.  In mock mode this is a no-op.
 #[cfg(feature = "mock-cuda")]
 #[allow(non_snake_case)]
 #[inline(always)]

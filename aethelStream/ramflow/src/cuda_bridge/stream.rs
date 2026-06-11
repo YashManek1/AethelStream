@@ -143,7 +143,7 @@ impl OverflowCheckToken {
             if query_result == CUDA_ERROR_NOT_READY {
                 return None;
             }
-            return Some(false);
+            Some(false)
         }
 
         #[cfg(feature = "mock-cuda")]

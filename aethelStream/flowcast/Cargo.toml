@@ -13,7 +13,8 @@ serde_json        = "1"
 thiserror         = "1"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile   = "3"
+criterion  = { version = "0.5", features = ["html_reports"] }
 
 [features]
 # Real GPU + io_uring path.
@@ -28,6 +29,10 @@ write-skip       = []
 multi-gpu        = []
 # Pass-through: enables WriteBudgetManager SSD wear tracking in ramflow.
 ssd-wear         = ["ramflow/ssd-wear"]
+
+[[bench]]
+name    = "flowcast_bench"
+harness = false
 
 [lib]
 name = "flowcast"

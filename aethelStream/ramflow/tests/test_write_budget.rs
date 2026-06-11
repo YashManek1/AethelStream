@@ -176,6 +176,94 @@ fn test_11_delta_round_trip_reconstructs_fp16_weights_exactly() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 11b — delta round-trip: wrapping semantics audit (M2-8c)
+// ---------------------------------------------------------------------------
+
+/// Verify that wrapping_sub(compress) followed by wrapping_add(decompress)
+/// reconstructs the updated weights exactly — for ALL i16 values including
+/// wrap-around cases that would fail with saturating or checked arithmetic.
+///
+/// Audit finding M2-8c: No in-file round-trip test for delta compression.
+/// This test executes the contract documented algebraically in the compress_delta
+/// and decompress_and_apply_delta implementations.
+///
+/// If wrapping semantics were accidentally changed to saturating_sub, the
+/// round-trip would fail for pairs that cross the i16 min/max boundary.
+#[cfg(feature = "ssd-wear")]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[test]
+fn test_11b_delta_round_trip_wrapping_semantics_bit_exact() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Unique temp dir per test run to avoid interference from parallel runs.
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "ramflow_delta_wrap_test_{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir for delta test");
+
+    const LAYER_IDX: u32 = 42;
+
+    // ── Case 1: Normal values (no wrap) ────────────────────────────────────
+    let original_case1: Vec<u8> = [0i16, 100, -100, 1000, -1000]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let updated_case1: Vec<u8> = [10i16, 200, -50, 1500, -500]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+
+    let _compressed_size = compress_delta(LAYER_IDX, &updated_case1, &original_case1, &tmp_dir)
+        .expect("compress_delta case 1 failed");
+    let restored = decompress_and_apply_delta(LAYER_IDX, &original_case1, &tmp_dir)
+        .expect("decompress_and_apply_delta case 1 failed");
+    assert_eq!(
+        restored, updated_case1,
+        "normal-values round-trip failed: restored != updated"
+    );
+
+    // ── Case 2: Wrap-around values — delta crosses i16::MAX boundary ───────
+    // original = 30000, updated = -30000
+    // delta = (-30000i16).wrapping_sub(30000i16) = -30000 - 30000 = -60000 (mod 2^16)
+    //       = -60000 + 65536 = 5536
+    // restored = 30000i16.wrapping_add(5536) = 35536 (mod 2^16)
+    //          = 35536 - 65536 = -30000 ✓
+    let orig_wrap: Vec<u8> = [30000i16].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let upd_wrap: Vec<u8> = [(-30000i16)].iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let _compressed_size_wrap = compress_delta(LAYER_IDX, &upd_wrap, &orig_wrap, &tmp_dir)
+        .expect("compress_delta wrap case failed");
+    let restored_wrap = decompress_and_apply_delta(LAYER_IDX, &orig_wrap, &tmp_dir)
+        .expect("decompress_and_apply_delta wrap case failed");
+    assert_eq!(
+        restored_wrap, upd_wrap,
+        "wrap-around round-trip failed: delta cross-boundary case broke"
+    );
+
+    // ── Case 3: Zero delta (original == updated) — round-trip is identity ──
+    let same: Vec<u8> = [42i16, -1, i16::MAX, i16::MIN]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+
+    let _compressed_size_zero = compress_delta(LAYER_IDX, &same, &same, &tmp_dir)
+        .expect("compress_delta zero case failed");
+    let restored_zero = decompress_and_apply_delta(LAYER_IDX, &same, &tmp_dir)
+        .expect("decompress_and_apply_delta zero case failed");
+    assert_eq!(
+        restored_zero, same,
+        "zero-delta identity failed: same buffer should round-trip to itself"
+    );
+
+    // Best-effort cleanup — test result is already recorded.
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// ---------------------------------------------------------------------------
 // Test 12 — INT8 checkpoint quantisation round-trip (pure Rust simulation)
 // ---------------------------------------------------------------------------
 

@@ -16,6 +16,12 @@ fn make_buf(size: usize) -> PinnedBuffer {
     PinnedBuffer::alloc(size).expect("alloc")
 }
 
+fn make_buf_filled(value: u8, size: usize) -> PinnedBuffer {
+    let mut buf = PinnedBuffer::alloc(size).expect("alloc");
+    buf.as_mut_slice().fill(value);
+    buf
+}
+
 // T10-1/T10-2: sub-threshold skips + accumulates; crossing flushes
 #[test]
 fn sub_threshold_skips_and_crossing_flushes() {
@@ -127,6 +133,80 @@ fn flush_epoch_end_writes_accumulated_layers() {
     // Accumulated deltas must be cleared.
     assert_eq!(sched.accumulated_delta(0), 0.0, "delta[0] must be cleared");
     assert_eq!(sched.accumulated_delta(1), 0.0, "delta[1] must be cleared");
+}
+
+// T10-6: accumulated delta increments by lr_grad_norm at each sub-threshold step (A9-f2).
+//
+// Verifies the per-step accumulation semantics: accumulated_delta must equal the
+// sum of all lr_grad_norm values submitted while the threshold is not crossed.
+#[test]
+fn accumulated_delta_increments_per_step() {
+    let backend = MockBackend::new();
+    let config = WritebackConfig {
+        skip_threshold: 10.0, // very high — never crossed during this test
+        max_skip_rate: 1.0,
+        max_inflight_writes: 8,
+        ..Default::default()
+    };
+    let mut sched = WritebackScheduler::with_config(WritebackMode::Immediate, config);
+    let src = make_buf(64);
+
+    for step in 1u32..=5 {
+        sched
+            .on_weights_updated(11, &src, 0, 0.1, &backend)
+            .expect("update");
+        let expected = step as f32 * 0.1;
+        let actual = sched.accumulated_delta(11);
+        assert!(
+            (actual - expected).abs() < 1e-5,
+            "step {step}: accumulated_delta = {actual:.6}, expected {expected:.6}"
+        );
+    }
+}
+
+// T10-7: after flush_epoch_end, written bytes are byte-identical to source (A9-f5).
+//
+// Verifies the final-write correctness guarantee: skipped-and-accumulated layers
+// must be flushed with the exact buffer content passed to flush_epoch_end.
+#[test]
+fn epoch_end_written_bytes_match_source() {
+    let backend = MockBackend::new();
+    let config = WritebackConfig {
+        skip_threshold: 1.0, // all small updates are sub-threshold → skipped
+        max_skip_rate: 1.0,
+        max_inflight_writes: 8,
+        ..Default::default()
+    };
+    let mut sched = WritebackScheduler::with_config(WritebackMode::Immediate, config);
+
+    let buf3 = make_buf_filled(0xCC, 128);
+    let buf8 = make_buf_filled(0xDD, 64);
+
+    // Both sub-threshold → skipped, not written yet.
+    sched.on_weights_updated(3, &buf3, 0, 0.0001, &backend).expect("layer 3");
+    sched.on_weights_updated(8, &buf8, 0, 0.0001, &backend).expect("layer 8");
+    assert!(backend.poll_completions().expect("poll").is_empty(), "no writes until epoch end");
+
+    let mut src_map = HashMap::new();
+    src_map.insert(3u32, &buf3);
+    src_map.insert(8u32, &buf8);
+    sched.flush_epoch_end(&src_map, &backend).expect("flush_epoch_end");
+    backend.poll_completions().expect("drain completions");
+
+    // Byte-identical verification (A9-f5).
+    let written3 = backend.last_written_bytes(3).expect("layer 3 must be written at epoch end");
+    assert_eq!(written3.len(), 128, "layer 3 written length");
+    assert!(
+        written3.iter().all(|&b| b == 0xCC),
+        "layer 3: written bytes must be 0xCC (byte-identical)"
+    );
+
+    let written8 = backend.last_written_bytes(8).expect("layer 8 must be written at epoch end");
+    assert_eq!(written8.len(), 64, "layer 8 written length");
+    assert!(
+        written8.iter().all(|&b| b == 0xDD),
+        "layer 8: written bytes must be 0xDD (byte-identical)"
+    );
 }
 
 // T10-5: max_skip_rate guard forces write when skip budget exhausted

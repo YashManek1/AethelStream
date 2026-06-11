@@ -1,10 +1,10 @@
-//! `ReadyLayer` -- the type handed to Module 5 when a prefetch completes.
+//! `ReadyLayer` — the type handed to Module 5 when a prefetch completes.
 //!
-//! M5 receives a `ReadyLayer` from `FlowCast::wait_for_layer`.  It must call
+//! M5 receives a `ReadyLayer` from `FlowCast::take_ready`.  It must call
 //! `FlowCast::retire_layer` when the GPU kernel is done.  Dropping a
-//! `ReadyLayer` automatically returns the pinned buffer to RamFlow pool.
+//! `ReadyLayer` automatically returns the pinned buffer to the RamFlow pool.
 
-use crate::config::Precision;
+use crate::config::{DevicePointer, Precision};
 use ramflow::pool::PoolSlot;
 
 /// A layer whose weights are resident in pinned RAM and ready for the GPU.
@@ -23,7 +23,18 @@ pub struct ReadyLayer {
     /// Pinned-RAM slot holding the layer weights.
     ///
     /// Returned to the pool ring when `ReadyLayer` is dropped.
-    pub(crate) slot: PoolSlot,
+    pub weight: PoolSlot,
+
+    /// GPU device-pointer slabs for this layer, in `(slab_index, DevicePointer)` pairs.
+    ///
+    /// Populated when the layer has been DMA'd to VRAM ahead of time (slab path);
+    /// empty when M5 is responsible for the H→D copy.
+    pub slab_device_ptrs: Vec<(u32, DevicePointer)>,
+
+    /// Whether M5 must call the quantized decoder before the GPU kernel.
+    ///
+    /// `true` for INT4 and INT8 precision layers; `false` for FP16/BF16/FP32.
+    pub needs_decode: bool,
 }
 
 impl ReadyLayer {
@@ -31,16 +42,16 @@ impl ReadyLayer {
     ///
     /// The slice is valid as long as this `ReadyLayer` is alive.
     pub fn as_slice(&self) -> &[u8] {
-        self.slot.buffer().as_slice()
+        self.weight.buffer().as_slice()
     }
 
     /// Length of the pinned buffer in bytes.
     pub fn len(&self) -> usize {
-        self.slot.buffer().len()
+        self.weight.buffer().len()
     }
 
     /// Returns `true` if the buffer is zero-sized (always `false` for valid layers).
     pub fn is_empty(&self) -> bool {
-        self.slot.buffer().is_empty()
+        self.weight.buffer().is_empty()
     }
 }

@@ -15,7 +15,7 @@ use crate::config::{HardwareProfile, LayerTiming};
 use crate::{FlowCastError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Mock constants (mock-cuda / GPU-less path)
@@ -125,6 +125,7 @@ impl Profiler {
             backward_ms,
             shard_bytes,
             transfer_ms: bytes_to_ms(shard_bytes, MOCK_NVME_BW_GBS),
+            pcie_transfer_ms: bytes_to_ms(shard_bytes, MOCK_PCIE_BW_GBS),
         });
         Ok(())
     }
@@ -241,20 +242,21 @@ fn representative_indices(num_layers: u32) -> Vec<u32> {
     v
 }
 
-fn measure_layer(layer_idx: u32, shard_dir: &PathBuf) -> LayerTiming {
+fn measure_layer(layer_idx: u32, shard_dir: &Path) -> LayerTiming {
     let shard_bytes = {
         let path = shard_dir.join(format!("layer_{layer_idx:04}.safetensor"));
         std::fs::metadata(&path).map(|m| m.len()).unwrap_or(MOCK_SHARD_BYTES)
     };
 
     #[cfg(feature = "mock-cuda")]
-    let (t_ssd_ms, t_gpu_ms) = (
+    let (t_ssd_ms, t_gpu_ms, t_pcie_ms) = (
         bytes_to_ms(shard_bytes, MOCK_NVME_BW_GBS),
         MOCK_FORWARD_MS,
+        bytes_to_ms(shard_bytes, MOCK_PCIE_BW_GBS),
     );
 
     #[cfg(not(feature = "mock-cuda"))]
-    let (t_ssd_ms, t_gpu_ms) = {
+    let (t_ssd_ms, t_gpu_ms, t_pcie_ms) = {
         use std::time::Instant;
         // t_ssd: 10 read-timing samples (alloc proxy on non-Linux)
         let mut total_ns = 0u128;
@@ -269,7 +271,11 @@ fn measure_layer(layer_idx: u32, shard_dir: &PathBuf) -> LayerTiming {
         let v: Vec<f32> = (0u32..1_000_000).map(|x| x as f32).collect();
         let _s: f32 = v.iter().sum();
         let t_gpu = start.elapsed().as_secs_f64() as f32 * 1000.0;
-        (t_ssd, t_gpu)
+        // t_pcie: simulate host→device DMA by touching the buffer (A3-b fix).
+        let pcie_start = Instant::now();
+        let _pcie_buf = vec![0u8; shard_bytes.min(4 * 1024 * 1024) as usize];
+        let t_pcie = pcie_start.elapsed().as_secs_f64() as f32 * 1000.0;
+        (t_ssd, t_gpu, t_pcie)
     };
 
     LayerTiming {
@@ -278,6 +284,7 @@ fn measure_layer(layer_idx: u32, shard_dir: &PathBuf) -> LayerTiming {
         backward_ms: t_gpu_ms * 2.0,
         shard_bytes,
         transfer_ms: t_ssd_ms,
+        pcie_transfer_ms: t_pcie_ms,
     }
 }
 
@@ -350,8 +357,13 @@ fn merge_section(path: &PathBuf, section: &FlowCastSection) -> Result<()> {
             })?;
         }
     }
-    std::fs::write(path, json)
-        .map_err(|e| FlowCastError::ProfileIo(format!("write {}: {e}", path.display())))
+    // Atomic write: write to a temp file then rename over the target so a
+    // concurrent writer cannot observe a partially-written file.
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, json)
+        .map_err(|e| FlowCastError::ProfileIo(format!("write tmp {}: {e}", tmp_path.display())))?;
+    std::fs::rename(&tmp_path, path)
+        .map_err(|e| FlowCastError::ProfileIo(format!("rename to {}: {e}", path.display())))
 }
 
 fn read_json(path: &PathBuf) -> Result<Value> {

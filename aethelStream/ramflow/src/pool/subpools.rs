@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::cuda_bridge::zero_copy::ZeroCopyRouter;
 use crate::pool::slow_path::SlowPathAllocator;
 use crate::pool::{LayerKind, PoolSlot, RingBuffer, TensorLocationDict, TensorSlab};
 use crate::{RamFlowError, Result};
@@ -149,6 +150,10 @@ impl PoolRegistry {
                 "zero_copy_threshold must be non-zero".into(),
             ));
         }
+
+        // Propagate the hardware-profiled threshold to the global zero-copy router so
+        // that subsequent ZeroCopyRouter::route() calls use the calibrated crossover.
+        ZeroCopyRouter::set_threshold(zero_copy_threshold);
 
         let large_slot_bytes = (zero_copy_threshold / 2).max(MINIMUM_SLOT_BYTES);
         let norm_slot_bytes = DEFAULT_NORM_SLOT_BYTES;

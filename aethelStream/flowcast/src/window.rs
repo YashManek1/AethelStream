@@ -68,10 +68,10 @@ pub struct AdaptiveWindow {
     atoms: Arc<WindowAtomics>,
     /// EWMA smoothing factor α ∈ (0, 1].
     alpha: f32,
-    /// Smoothed GPU idle fraction.
-    smoothed_idle: f32,
-    /// Smoothed I/O latency (ms).
-    smoothed_io_ms: f32,
+    /// EWMA-smoothed NVMe→RAM transfer time (milliseconds).
+    smoothed_ssd_ms: f32,
+    /// EWMA-smoothed GPU compute time per layer (milliseconds).
+    smoothed_gpu_ms: f32,
 }
 
 impl AdaptiveWindow {
@@ -83,27 +83,51 @@ impl AdaptiveWindow {
         Self {
             atoms: Arc::new(WindowAtomics::new(clamped, w_max.max(1.0))),
             alpha,
-            smoothed_idle: 0.0,
-            smoothed_io_ms: 0.0,
+            smoothed_ssd_ms: 0.0,
+            smoothed_gpu_ms: 0.0,
         }
     }
 
-    /// Register high/low pressure callbacks on `gauge`.
+    /// Register high/soft/low pressure callbacks on `gauge`.
     ///
-    /// Must be called before the first `update()`. The callbacks hold a weak
+    /// Must be called before the first `update()`. The callbacks hold an
     /// `Arc` clone of the internal state, so the window can outlive the gauge.
-    pub fn register_pressure_callbacks(&self, gauge: &ramflow::MemoryPressureGauge) {
-        // High pressure: cap window to 1, set flag.
+    ///
+    /// Pass `Some(backend)` in production so high/low callbacks call
+    /// `backend.set_pause(true/false)` directly.  Pass `None` in tests where
+    /// no real backend is present (mock path does not need pause/resume control).
+    pub fn register_pressure_callbacks(
+        &self,
+        gauge: &ramflow::MemoryPressureGauge,
+        backend: Option<std::sync::Arc<dyn crate::backend::IoBackend>>,
+    ) {
+        // High pressure: cap window to 1, set flag, pause backend if present.
         let atoms_high = Arc::clone(&self.atoms);
+        let backend_high = backend.clone();
         gauge.register_high_pressure(move |_pressure| {
             atoms_high.pressure_cap_active.store(true, Ordering::Release);
             atoms_high.set_t_iter(1.0);
+            if let Some(ref be) = backend_high {
+                be.set_pause(true);
+            }
         });
 
-        // Low pressure: lift cap, allow growth.
+        // Soft pressure: pre-emptive window shrink before the hard stop.
+        // Does not pause the backend; just tightens the window by half.
+        let atoms_soft = Arc::clone(&self.atoms);
+        gauge.register_soft_pressure(move |_pressure| {
+            let current = atoms_soft.t_iter();
+            atoms_soft.set_t_iter((current * 0.5).max(1.0));
+        });
+
+        // Low pressure: lift cap, resume backend if present.
         let atoms_low = Arc::clone(&self.atoms);
+        let backend_low = backend;
         gauge.register_low_pressure(move |_pressure| {
             atoms_low.pressure_cap_active.store(false, Ordering::Release);
+            if let Some(ref be) = backend_low {
+                be.set_pause(false);
+            }
         });
     }
 
@@ -112,40 +136,47 @@ impl AdaptiveWindow {
         self.atoms.t_iter()
     }
 
-    /// Update window given observed `gpu_idle_fraction` and `io_latency_ms`.
+    /// Update window given observed `ssd_transfer_ms` and `gpu_compute_ms`.
     ///
-    /// Algorithm:
+    /// Algorithm (A2-b/c/d spec):
     /// 1. EWMA-smooth both signals.
-    /// 2. If high pressure cap is active → hold at 1 (cap always wins).
-    /// 3. Else if GPU idle > 0.10 (I/O bound) → grow by 1.
-    /// 4. Else if I/O latency increasing and idle < 0.05 → shrink by 1.
-    /// 5. Clamp to `[1, W_max]`.
+    /// 2. Compute `next` using grow/shrink predicates based on t_ssd/t_gpu ratio.
+    ///    * Grow if `smoothed_ssd_ms > 0.8 × smoothed_gpu_ms` (SSD is the
+    ///      bottleneck: GPU will stall without a larger prefetch window).
+    ///    * Shrink if `smoothed_gpu_ms > 2.0 × smoothed_ssd_ms` (SSD is much
+    ///      faster than GPU: window is oversized and wasting RAM).
+    /// 3. Clamp `next` to `[1, W_max]`.
+    /// 4. Apply pressure cap override **after** clamp (A2-d fix: EWMA always
+    ///    runs; cap overrides the computed value rather than short-circuiting).
     ///
     /// # Errors
     /// Always `Ok(())`.
-    pub fn update(&mut self, gpu_idle_fraction: f32, io_latency_ms: f32) -> Result<()> {
-        self.smoothed_idle =
-            self.alpha * gpu_idle_fraction + (1.0 - self.alpha) * self.smoothed_idle;
-        let prev_io = self.smoothed_io_ms;
-        self.smoothed_io_ms =
-            self.alpha * io_latency_ms + (1.0 - self.alpha) * self.smoothed_io_ms;
+    pub fn update(&mut self, ssd_transfer_ms: f32, gpu_compute_ms: f32) -> Result<()> {
+        // Step 1: EWMA smooth (always runs, even under pressure — A2-d).
+        self.smoothed_ssd_ms =
+            self.alpha * ssd_transfer_ms + (1.0 - self.alpha) * self.smoothed_ssd_ms;
+        self.smoothed_gpu_ms =
+            self.alpha * gpu_compute_ms + (1.0 - self.alpha) * self.smoothed_gpu_ms;
 
-        // Pressure cap always wins.
-        if self.atoms.pressure_cap_active.load(Ordering::Acquire) {
-            self.atoms.set_t_iter(1.0);
-            return Ok(());
-        }
-
+        // Step 2: grow/shrink decision (A2-b/c spec predicates).
         let mut next = self.atoms.t_iter();
-        if self.smoothed_idle > 0.10 {
-            // GPU idling waiting for I/O → grow window.
+        if self.smoothed_ssd_ms > 0.8 * self.smoothed_gpu_ms {
+            // SSD is the bottleneck: widen the prefetch window.
             next += 1.0;
-        } else if self.smoothed_io_ms > prev_io * 1.05 && self.smoothed_idle < 0.05 {
-            // I/O latency rising, GPU not stalling → shrink.
+        } else if self.smoothed_gpu_ms > 2.0 * self.smoothed_ssd_ms {
+            // SSD vastly faster than GPU: window is oversized, reclaim RAM.
             next -= 1.0;
         }
 
+        // Step 3: clamp to [1, W_max].
         next = next.max(1.0).min(self.atoms.w_max());
+
+        // Step 4: pressure cap overrides computed value (A2-d fix — cap checked
+        // AFTER the clamp so EWMA is always updated regardless of pressure).
+        if self.atoms.pressure_cap_active.load(Ordering::Acquire) {
+            next = 1.0;
+        }
+
         self.atoms.set_t_iter(next);
         Ok(())
     }
