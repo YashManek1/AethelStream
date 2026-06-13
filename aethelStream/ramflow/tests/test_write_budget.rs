@@ -1,4 +1,4 @@
-// tests/test_write_budget.rs — Sprint 5 Module 2 Tests 10, 11, 12
+﻿// tests/test_write_budget.rs — Sprint 5 Module 2 Tests 10, 11, 12
 //
 // Run Tests 10 and 11 (ssd-wear required):
 //   cargo test --no-default-features --features "mock-cuda,ssd-wear" --test test_write_budget
@@ -288,15 +288,15 @@ fn test_12_int8_checkpoint_round_trip_deviation_within_spec() {
         .collect();
 
     // ── Phase 1: per-channel scale = max_abs / 127.0 ────────────────────────
-    let mut scales = vec![1.0f32; N_CHANNELS];
-    for channel in 0..N_CHANNELS {
+    let mut scales = [1.0f32; N_CHANNELS];
+    for (channel, scale) in scales.iter_mut().enumerate() {
         let start = channel * ELEMS_PER_CHANNEL;
         let end = start + ELEMS_PER_CHANNEL;
         let max_abs: f32 = values[start..end]
             .iter()
             .map(|value| value.abs())
             .fold(0.0f32, f32::max);
-        scales[channel] = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+        *scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
     }
 
     // ── Phase 2: quantise to INT8 ────────────────────────────────────────────

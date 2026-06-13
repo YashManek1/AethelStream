@@ -139,13 +139,11 @@ impl FlowCast {
             // `DefaultPhaseClassifier::new` reads the cached profile if present.
             // We only use `with_defaults()` when the file is absent so the pool
             // slot counts and sizes are calibrated to the real model on warm runs.
-            if profile_path.exists() {
-                ramflow::PoolRegistry::with_defaults()
-                    .map_err(FlowCastError::RamFlow)?
-            } else {
-                ramflow::PoolRegistry::with_defaults()
-                    .map_err(FlowCastError::RamFlow)?
-            }
+            // `with_defaults()` handles both the profiled and first-run cases;
+            // the distinction is reserved for a future profile-driven path.
+            let _ = profile_path.exists();
+            ramflow::PoolRegistry::with_defaults()
+                .map_err(FlowCastError::RamFlow)?
         };
 
         // C5: pressure gauge — sample interval ~30 steps (calibrated externally).

@@ -53,6 +53,19 @@ pub enum RamFlowError {
         /// Tensor name that was requested.
         name: String,
     },
+
+    /// A completed NVMe read produced bytes whose xxHash3 digest did not match
+    /// the value stored in `shard_index.json`.  The shard file is corrupted or
+    /// the hardware silently flipped bits mid-transfer.
+    #[error("shard {shard_id} corrupted: expected xxh3={expected:#018x}, got {got:#018x}")]
+    ShardCorrupted {
+        /// Shard file index (matches the numeric suffix of `shard_NNNN.bin`).
+        shard_id: u32,
+        /// xxHash3-64 digest from `shard_index.json`.
+        expected: u64,
+        /// xxHash3-64 digest computed from received bytes.
+        got: u64,
+    },
 }
 
 /// Crate-wide `Result` alias.  Every public API that can fail returns this.

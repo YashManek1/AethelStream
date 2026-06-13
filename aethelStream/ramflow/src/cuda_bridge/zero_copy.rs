@@ -77,6 +77,7 @@ impl ZeroCopyRouter {
     /// Returns [`crate::RamFlowError::CudaError`] when CUDA pointer lookup,
     /// allocation, or copy submission fails.
     pub fn route(&self, buf: &PinnedBuffer, stream: &CudaStream) -> Result<TransferStrategy> {
+#[cfg(feature = "mmap-fallback")] if !buf.is_pinned() { return route_via_staging(buf, stream); }
         if buf.len() < Self::threshold() && buf.is_mapped() {
             let device_ptr = device_pointer_for_mapped_buffer(buf)?;
             return Ok(TransferStrategy::ZeroCopy { device_ptr });
@@ -112,6 +113,35 @@ impl Default for ZeroCopyRouter {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Transfer an mmap-backed buffer to VRAM via a temporary pinned staging copy.
+///
+/// Allocation cost: one `PinnedBuffer::alloc(buf.len())` per call.
+/// A future optimisation is a reusable fixed-size staging pool.
+///
+/// # Why staging?
+/// mmap buffers are pageable — the GPU's DMA engine cannot address them
+/// directly. We must copy mmap -> pinned staging (CPU memcpy, uses memory
+/// bandwidth) then initiate cudaMemcpyAsync from the pinned buffer.
+#[cfg(feature = "mmap-fallback")]
+fn route_via_staging(buf: &PinnedBuffer, stream: &CudaStream) -> Result<TransferStrategy> {
+    use crate::allocator::PinnedBuffer as Pinned;
+    let mut staging = Pinned::alloc(buf.len())?;
+    staging.as_mut_slice().copy_from_slice(buf.as_slice());
+    let device_ptr = unsafe { cuda_malloc_async(staging.len(), stream.as_raw())? };
+    unsafe {
+        cuda_memcpy_async_host_to_device(
+            device_ptr,
+            staging.as_ptr() as *const c_void,
+            staging.len(),
+            stream.as_raw(),
+        )?;
+    }
+    drop(staging);
+    Ok(TransferStrategy::DmaCopy {
+        stream: CudaStream::new()?,
+    })
 }
 
 pub(crate) fn device_pointer_for_mapped_buffer(buf: &PinnedBuffer) -> Result<DevicePointer> {

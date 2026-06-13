@@ -22,6 +22,9 @@ use ramflow::{
 };
 use std::sync::Arc;
 
+#[cfg(feature = "lz4-cache")]
+use lz4_flex;
+
 // ---------------------------------------------------------------------------
 // Benchmark 1: Allocator — PinnedBuffer vs Vec
 // ---------------------------------------------------------------------------
@@ -30,7 +33,7 @@ fn bench_allocator(c: &mut Criterion) {
     let sizes: &[usize] = &[
         4 * 1024,          // 4 KB  — small bias/norm tensor
         64 * 1024,         // 64 KB — medium attention slice
-        1 * 1024 * 1024,   // 1 MB  — norm pool slot
+        1024 * 1024,       // 1 MB  — norm pool slot
         64 * 1024 * 1024,  // 64 MB — full attention/MLP slot
     ];
 
@@ -394,6 +397,219 @@ fn bench_alignment_validation(c: &mut Criterion) {
     group.finish();
 }
 
+
+// ---------------------------------------------------------------------------
+// Benchmark 8: alloc_pinned_huge vs alloc — mmap+madvise vs posix_memalign
+// ---------------------------------------------------------------------------
+// Run with:
+//   cargo bench --no-default-features --features "mock-cuda,hugepages" -- hugepages/
+//
+// In mock-cuda mode, cudaHostRegister is a no-op, so this measures the raw
+// mmap+madvise vs posix_memalign cost.  On a real GPU host, the full
+// cudaHostRegister walk dominates at large sizes; hugepages reduce that cost
+// by 512x per 2 MiB because the driver visits fewer page-table entries.
+
+#[cfg(feature = "hugepages")]
+fn bench_hugepage_alloc(c: &mut Criterion) {
+    use ramflow::PinnedBuffer;
+
+    let sizes: &[(usize, &str)] = &[
+        (2 * 1024 * 1024, "2_MiB"),
+        (64 * 1024 * 1024, "64_MiB"),
+    ];
+
+    let mut group = c.benchmark_group("hugepages");
+
+    for (size_bytes, label) in sizes {
+        group.throughput(Throughput::Bytes(*size_bytes as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("alloc_huge", label),
+            size_bytes,
+            |b, &sz| {
+                b.iter(|| {
+                    let buf = PinnedBuffer::alloc_pinned_huge(black_box(sz))
+                        .expect("alloc_pinned_huge");
+                    drop(buf);
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("alloc_standard", label),
+            size_bytes,
+            |b, &sz| {
+                b.iter(|| {
+                    let buf = PinnedBuffer::alloc(black_box(sz)).expect("alloc");
+                    drop(buf);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+#[cfg(not(feature = "hugepages"))]
+fn bench_hugepage_alloc(_c: &mut Criterion) {}
+
+// ---------------------------------------------------------------------------
+// NUMA bench: compare alloc + mbind to plain alloc
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "numa")]
+fn bench_numa_binding(c: &mut Criterion) {
+    use ramflow::allocator::{numa, PinnedBuffer};
+    const BENCH_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
+
+    let mut group = c.benchmark_group("numa");
+
+    group.bench_function("alloc_no_bind", |bench| {
+        bench.iter(|| {
+            let buf = PinnedBuffer::alloc(black_box(BENCH_SIZE)).expect("alloc");
+            drop(buf);
+        });
+    });
+
+    group.bench_function("alloc_then_mbind_node0", |bench| {
+        bench.iter(|| {
+            let buf = PinnedBuffer::alloc(black_box(BENCH_SIZE)).expect("alloc");
+            // mbind returns false on non-Linux; cost measured is the call overhead.
+            let _ = numa::mbind_buffer(buf.as_ptr() as *mut u8, BENCH_SIZE, 0);
+            drop(buf);
+        });
+    });
+
+    group.finish();
+}
+
+#[cfg(not(feature = "numa"))]
+fn bench_numa_binding(_c: &mut Criterion) {}
+
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Benchmark 9: LZ4 eviction cache — decompress throughput vs synthetic SSD
+//
+// Run: cargo bench --no-default-features --features "mock-cuda,lz4-cache" -- lz4/
+//
+// Crossover point: LZ4 decompression at 4-5 GB/s/core beats a consumer NVMe
+// queue-depth-1 read (~3-4 GB/s effective) for layers larger than ~4 MiB.
+// At 16 MiB (typical 7B attention block) the benefit is clear.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "lz4-cache")]
+fn bench_lz4_eviction_cache(c: &mut Criterion) {
+    use ramflow::pool::{CachePrecision, EvictionCache};
+
+    let sizes: &[(usize, &str)] = &[
+        (1024 * 1024, "1_MiB"),
+        (4 * 1024 * 1024, "4_MiB"),
+        (16 * 1024 * 1024, "16_MiB"),
+    ];
+
+    let mut group = c.benchmark_group("lz4");
+
+    for &(size, label) in sizes {
+        group.throughput(Throughput::Bytes(size as u64));
+
+        // Synthetic weight pattern: near-zero runs interleaved with random bytes,
+        // representative of real trained weights (~0.6x compression ratio).
+        let original: Vec<u8> = (0..size)
+            .map(|index| {
+                if (index & 0x3F) == 0 {
+                    0u8
+                } else {
+                    let v = (index as u64)
+                        .wrapping_mul(2862933555777941757)
+                        .wrapping_add(3037000499);
+                    (v >> 56) as u8
+                }
+            })
+            .collect();
+
+        // Measure compressed size once for the baseline.
+        let compressed_size = lz4_flex::compress(&original).len();
+
+        // Bench: full EvictionCache compress + decompress round trip.
+        group.bench_with_input(
+            BenchmarkId::new("decompress", label),
+            &size,
+            |b, &sz| {
+                b.iter(|| {
+                    let mut cache = EvictionCache::new(256 * 1024 * 1024);
+                    cache
+                        .compress(0, black_box(&original), CachePrecision::Fp16)
+                        .expect("compress");
+                    let mut dst = vec![0u8; sz];
+                    cache
+                        .decompress(0, black_box(dst.as_mut_slice()))
+                        .expect("decompress");
+                    black_box(dst.as_ptr());
+                });
+            },
+        );
+
+        // Baseline: Vec::clone of the compressed payload — the theoretical floor
+        // cost assuming zero NVMe seek/DMA latency. Real NVMe adds microseconds
+        // on top of this. When decompress is faster than clone, LZ4 wins.
+        group.bench_with_input(
+            BenchmarkId::new("memcopy_compressed_floor", label),
+            &compressed_size,
+            |b, &csz| {
+                let src = vec![0u8; csz];
+                b.iter(|| {
+                    let dst = black_box(src.clone());
+                    black_box(dst.as_ptr());
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+#[cfg(not(feature = "lz4-cache"))]
+fn bench_lz4_eviction_cache(_c: &mut Criterion) {}
+
+// ---------------------------------------------------------------------------
+// Benchmark N: xxHash3 throughput — must exceed NVMe read bandwidth
+// ---------------------------------------------------------------------------
+//
+// xxHash3 runs at ~30 GB/s on modern x86_64.  Consumer NVMe tops out at
+// ~3-7 GB/s, so checksum verification adds zero wall-clock latency to the
+// read pipeline.  This bench exists to catch any regression that would flip
+// that relationship.
+//
+// Run: cargo bench --no-default-features --features "mock-cuda,checksums" --bench ramflow_bench xxhash3
+
+#[cfg(feature = "checksums")]
+fn bench_xxhash3_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("xxhash3");
+
+    for &size in &[1024usize * 1024, 4 * 1024 * 1024] {
+        let label = if size == 1024 * 1024 { "1MB" } else { "4MB" };
+        let data: Vec<u8> = (0u8..=255).cycle().take(size).collect();
+
+        group.throughput(Throughput::Bytes(size as u64));
+        group.bench_with_input(
+            BenchmarkId::new("xxh3_64", label),
+            &data,
+            |b, d| {
+                b.iter(|| {
+                    let h = xxhash_rust::xxh3::xxh3_64(black_box(d));
+                    black_box(h);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+#[cfg(not(feature = "checksums"))]
+fn bench_xxhash3_throughput(_c: &mut Criterion) {}
+
 // ---------------------------------------------------------------------------
 // Criterion groups
 // ---------------------------------------------------------------------------
@@ -407,5 +623,9 @@ criterion_group!(
     bench_int8_compression,
     bench_delta_compression,
     bench_alignment_validation,
+    bench_hugepage_alloc,
+    bench_numa_binding,
+    bench_lz4_eviction_cache,
+    bench_xxhash3_throughput,
 );
 criterion_main!(benches);

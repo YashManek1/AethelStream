@@ -1,4 +1,4 @@
-// src/pool/ring_buffer.rs — pre-allocated pinned-buffer pool ring
+﻿// src/pool/ring_buffer.rs — pre-allocated pinned-buffer pool ring
 //
 // Sprint 3A: full implementation replacing Sprint 0 stubs.
 //
@@ -67,7 +67,7 @@ impl ResizableState {
     /// # Errors
     /// Returns [`RamFlowError::AllocationFailed`] if `capacity` or `slot_bytes`
     /// is zero, or if any `PinnedBuffer::alloc` fails.
-    fn allocate(slot_bytes: usize, capacity: usize) -> Result<Self> {
+    fn allocate(slot_bytes: usize, capacity: usize, numa_node: Option<u32>) -> Result<Self> {
         if capacity == 0 {
             return Err(RamFlowError::AllocationFailed(
                 "RingBuffer capacity must be at least 1".into(),
@@ -81,7 +81,21 @@ impl ResizableState {
 
         let mut free_queue = std::collections::VecDeque::with_capacity(capacity);
         for slot_index in 0..capacity {
-            let pinned_buffer = PinnedBuffer::alloc(slot_bytes).inspect_err(|_| {
+            // Route large slots through hugepage-backed allocation when the
+            // `hugepages` feature is active.  Smaller slots use standard
+            // posix_memalign; there is no TLB benefit below 2 MiB.
+            #[cfg(feature = "hugepages")]
+            let alloc_fn = |sz: usize| {
+                if sz >= crate::allocator::huge::HUGEPAGE_THRESHOLD {
+                    PinnedBuffer::alloc_pinned_huge(sz)
+                } else {
+                    PinnedBuffer::alloc(sz)
+                }
+            };
+            #[cfg(not(feature = "hugepages"))]
+            let alloc_fn = PinnedBuffer::alloc;
+
+            let pinned_buffer = alloc_fn(slot_bytes).inspect_err(|_| {
                 // On partial failure, drop all already-inserted buffers.
                 // ManuallyDrop does NOT run the inner destructor, so we must.
                 //
@@ -92,14 +106,58 @@ impl ResizableState {
                     unsafe { ManuallyDrop::drop(&mut manually_dropped_buffer) };
                 }
             })?;
+            #[cfg(all(feature = "numa", target_os = "linux"))]
+            if let Some(node) = numa_node {
+                // Bind this slot to the GPU NUMA node.  Failure is non-fatal.
+                let _ = crate::allocator::numa::mbind_buffer(pinned_buffer.as_ptr() as *mut u8, slot_bytes, node);
+            }
             free_queue.push_back((slot_index, ManuallyDrop::new(pinned_buffer)));
         }
+
+        // On non-Linux or without the numa feature the parameter is unused.
+        #[cfg(not(all(feature = "numa", target_os = "linux")))]
+        let _ = numa_node;
 
         Ok(ResizableState {
             free_queue,
             capacity,
             slot_bytes,
         })
+    }
+
+    /// Allocate `capacity` mmap-backed buffers of `slot_bytes` bytes each.
+    ///
+    /// Used by `RingBuffer::new_mmap` for graceful-degradation pool construction.
+    ///
+    /// # Errors
+    /// Returns `AllocationFailed` if capacity or slot_bytes is zero, or if any
+    /// `PinnedBuffer::alloc_mmap` fails.
+    #[cfg(feature = "mmap-fallback")]
+    fn allocate_mmap(slot_bytes: usize, capacity: usize) -> Result<Self> {
+        if capacity == 0 {
+            return Err(RamFlowError::AllocationFailed(
+                "RingBuffer mmap capacity must be at least 1".into(),
+            ));
+        }
+        if slot_bytes == 0 {
+            return Err(RamFlowError::AllocationFailed(
+                "RingBuffer mmap slot_bytes must be at least 1".into(),
+            ));
+        }
+
+        let mut free_queue = std::collections::VecDeque::with_capacity(capacity);
+        for slot_index in 0..capacity {
+            let mmap_buf = PinnedBuffer::alloc_mmap(slot_bytes).inspect_err(|_| {
+                for (_, mut manually_dropped_buffer) in free_queue.drain(..) {
+                    // SAFETY: each buffer in free_queue was produced by PinnedBuffer::alloc_mmap
+                    // and is exclusively owned here — no PoolSlot references any of them.
+                    unsafe { ManuallyDrop::drop(&mut manually_dropped_buffer) };
+                }
+            })?;
+            free_queue.push_back((slot_index, ManuallyDrop::new(mmap_buf)));
+        }
+
+        Ok(ResizableState { free_queue, capacity, slot_bytes })
     }
 }
 
@@ -159,6 +217,10 @@ pub struct RingBuffer {
 
     /// Condvar woken by `release`; waited on by `claim_blocking`.
     condvar: Condvar,
+
+    /// NUMA node for pool-slot page binding (-1 = no binding, >= 0 = node index).
+    /// Set via apply_numa_binding(); read by resize() when repopulating slots.
+    numa_node: std::sync::atomic::AtomicI32,
 }
 
 // SAFETY: `RingBuffer` is `Send` because all state is either atomic (inherently
@@ -182,7 +244,7 @@ impl RingBuffer {
     /// Returns [`RamFlowError::AllocationFailed`] if `capacity` or `slot_bytes`
     /// is zero, or if any individual `PinnedBuffer::alloc` fails.
     pub fn new(slot_bytes: usize, capacity: usize) -> Result<Self> {
-        let resizable_state = ResizableState::allocate(slot_bytes, capacity)?;
+        let resizable_state = ResizableState::allocate(slot_bytes, capacity, None)?;
 
         // tail starts at `capacity` so tail - head = capacity (all slots free).
         Ok(RingBuffer {
@@ -191,6 +253,28 @@ impl RingBuffer {
             active_claims: AtomicUsize::new(0),
             inner: Mutex::new(resizable_state),
             condvar: Condvar::new(),
+            numa_node: std::sync::atomic::AtomicI32::new(-1),
+        })
+    }
+
+    /// Construct a ring buffer with mmap-backed slots (graceful-degradation mode).
+    ///
+    /// Uses `PinnedBuffer::alloc_mmap` instead of `PinnedBuffer::alloc`.
+    /// Slots returned by `try_claim`/`claim_blocking` have `is_pinned() == false`.
+    ///
+    /// # Errors
+    /// Returns `AllocationFailed` if capacity or slot_bytes is zero, or if any
+    /// `PinnedBuffer::alloc_mmap` fails.
+    #[cfg(feature = "mmap-fallback")]
+    pub fn new_mmap(slot_bytes: usize, capacity: usize) -> Result<Self> {
+        let resizable_state = ResizableState::allocate_mmap(slot_bytes, capacity)?;
+        Ok(RingBuffer {
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(capacity),
+            active_claims: AtomicUsize::new(0),
+            inner: Mutex::new(resizable_state),
+            condvar: Condvar::new(),
+            numa_node: std::sync::atomic::AtomicI32::new(-1),
         })
     }
 
@@ -354,6 +438,38 @@ impl RingBuffer {
     ///
     /// # Preconditions
     ///
+
+    /// Bind all current and future pool slots to a NUMA node.
+    ///
+    /// Calls mbind(MPOL_BIND) on every free buffer in the ring and stores the
+    /// node so resize() rebinds new slots too.  In-flight slots are not touched
+    /// (the ring holds no references to them); in practice PoolRegistry calls
+    /// this at startup before any claims are made.
+    ///
+    /// A mbind failure is not an error -- NUMA binding is a performance hint.
+    /// No-op on non-Linux or without the `numa` feature.
+    #[cfg(all(feature = "numa", target_os = "linux"))]
+    pub fn apply_numa_binding(&self, node: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.numa_node.store(node as i32, Relaxed);
+        let state_guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let slot_bytes = state_guard.slot_bytes;
+        for (_, buf) in &state_guard.free_queue {
+            // SAFETY: buffer is in the free queue, no PoolSlot holds it,
+            // so we have exclusive access under the Mutex lock.
+            if !crate::allocator::numa::mbind_buffer(
+                unsafe { buf.as_ptr() as *mut u8 },
+                slot_bytes,
+                node,
+            ) {
+                break; // mbind failed (EPERM); stop -- subsequent would also fail
+            }
+        }
+    }
+
     /// The phase fence MUST be held and `claimed_slots() == 0` before calling
     /// this method.  In-flight `PoolSlot`s hold slot indices that belong to the
     /// discarded `ResizableState`; their `drop` would corrupt the new pool.
@@ -379,7 +495,11 @@ impl RingBuffer {
         }
 
         let current_slot_bytes = state_guard.slot_bytes;
-        let new_state = ResizableState::allocate(current_slot_bytes, new_capacity)?;
+        let numa = {
+            let n = self.numa_node.load(std::sync::atomic::Ordering::Relaxed);
+            if n >= 0 { Some(n as u32) } else { None }
+        };
+        let new_state = ResizableState::allocate(current_slot_bytes, new_capacity, numa)?;
 
         // Reset atomics under the Mutex so no concurrent observer sees an
         // intermediate state.

@@ -89,7 +89,19 @@ pub mod emergency;
 /// Page-locked (pinned) host buffer visible to both CPU and GPU.
 ///
 /// Has two registration modes: Default (DMA only) and Mapped (DMA + UVA).
+/// When the `mmap-fallback` feature is active, `PinnedBuffer::alloc_mmap` creates
+/// a pageable variant (`is_pinned() == false`) for low-RAM machines.
 pub use allocator::PinnedBuffer;
+
+/// Allocation kind discriminant: Standard (posix_memalign) or Huge (mmap + hugepages).
+pub use allocator::AllocKind;
+
+/// Minimum slot size in bytes for hugepage-backed allocation (2 MiB, feature = "hugepages").
+#[cfg(feature = "hugepages")]
+pub use allocator::HUGEPAGE_THRESHOLD;
+
+/// NUMA topology config returned by [llocator::numa::detect].
+pub use allocator::NumaConfig;
 
 /// Central registry of all pool shards. Routes `claim(LayerKind)` to the
 /// correct ring buffer and owns all per-layer `TensorSlab`s.
@@ -111,3 +123,65 @@ pub use scheduler::PerLayerScaleTable;
 
 /// Per-layer packed single allocation for all small tensors (Alg 5).
 pub use pool::TensorSlab;
+
+// ---------------------------------------------------------------------------
+// lz4-cache re-exports — available when feature = "lz4-cache"
+// ---------------------------------------------------------------------------
+
+/// Telemetry snapshot for the LZ4 eviction cache (feature = "lz4-cache").
+///
+/// Retrieved via [`PoolRegistry::lz4_cache_telemetry`].
+#[cfg(feature = "lz4-cache")]
+pub use pool::eviction_cache::Lz4CacheTelemetry;
+
+/// Precision discriminant stored per LZ4 cache entry (feature = "lz4-cache").
+#[cfg(feature = "lz4-cache")]
+pub use pool::eviction_cache::CachePrecision;
+
+// ---------------------------------------------------------------------------
+// mmap-fallback re-exports — available when feature = "mmap-fallback"
+// ---------------------------------------------------------------------------
+
+/// mmap-backed host buffer for graceful-degradation streaming (feature = "mmap-fallback").
+///
+/// Allocated via `mmap(MAP_PRIVATE|MAP_ANONYMOUS)` + `madvise(MADV_SEQUENTIAL)`.
+/// `is_pinned()` is always `false` for this buffer type.
+#[cfg(feature = "mmap-fallback")]
+pub use allocator::MmapBuffer;
+
+/// Unified buffer enum covering pinned and mmap-backed allocations.
+///
+/// Internal type used by callers that must handle both allocation tiers.
+#[cfg(feature = "mmap-fallback")]
+pub use allocator::AnyBuffer;
+
+/// Common access interface implemented by [`PinnedBuffer`], [`MmapBuffer`], and [`AnyBuffer`].
+#[cfg(feature = "mmap-fallback")]
+pub use allocator::BufferAccess;
+
+
+// ---------------------------------------------------------------------------
+// DirectStorage re-exports — available when feature = "direct-storage"
+// ---------------------------------------------------------------------------
+
+/// Capability probe result for Windows DirectStorage (feature = "direct-storage").
+///
+/// Returned by [`probe_direct_storage`]. On non-Windows platforms or when
+/// `dstorage.dll` is absent, always `Unavailable`.
+#[cfg(feature = "direct-storage")]
+pub use nvme::direct_storage::DirectStorageCapability;
+
+/// Probe for Windows DirectStorage availability at runtime (feature = "direct-storage").
+///
+/// Loads `dstorage.dll` transiently and checks for the `DStorageGetFactory` export.
+/// Returns [`DirectStorageCapability::Unavailable`] on non-Windows or when the DLL
+/// is not installed; never panics.
+#[cfg(feature = "direct-storage")]
+pub use nvme::direct_storage::probe_direct_storage;
+
+/// Allocate a 4 096-byte-aligned [`PinnedBuffer`] for DirectStorage GPU transfers.
+///
+/// The `DSTORAGE_REQUEST_DESTINATION_BUFFER` path requires 4 096-byte alignment;
+/// the standard [`PinnedBuffer::alloc`] guarantees only 512-byte alignment.
+#[cfg(feature = "direct-storage")]
+pub use nvme::direct_storage::alloc_windows_ds_compatible;

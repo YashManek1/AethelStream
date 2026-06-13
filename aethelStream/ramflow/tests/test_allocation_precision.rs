@@ -1,4 +1,4 @@
-// tests/test_allocation_precision.rs
+﻿// tests/test_allocation_precision.rs
 //
 // Complete Sprint 1 test suite for PinnedBuffer.
 //
@@ -33,12 +33,7 @@ fn vm_rss_kb() -> Option<u64> {
     None
 }
 
-/// Force all pages of a Vec to be committed by the OS (touch every page).
-fn touch_vec(v: &mut Vec<u8>) {
-    for chunk in v.chunks_mut(4096) {
-        chunk[0] = 0xAA;
-    }
-}
+
 
 // ════════════════════════════════════════════════════════════════
 // UNIT TESTS — run on every platform, no GPU required
@@ -606,7 +601,7 @@ fn simulate_model_layer_streaming() {
     // ── Phase 2: Small tensor slabs (one per layer in the window) ────────
     println!("\n▶ Phase 2: Small tensor slabs (LayerNorm + LoRA adapters)");
 
-    let mut small_slabs: Vec<PinnedBuffer> = (0..sliding_window_count)
+    let small_slabs: Vec<PinnedBuffer> = (0..sliding_window_count)
         .map(|i| {
             // alloc_mapped because these go through the zero-copy path in Sprint 4
             let mut buf = PinnedBuffer::alloc_mapped(small_tensor_slab_bytes)
@@ -734,7 +729,7 @@ fn simulate_exact_240_mb_pinning() {
             "  ✓ Chunk {i}: {:.3} MB at {:p} (512-aligned: {})",
             size as f64 / 1e6,
             buf.as_ptr(),
-            buf.as_ptr() as usize % 512 == 0
+            (buf.as_ptr() as usize).is_multiple_of(512)
         );
         assert_eq!(buf.len(), size, "chunk {i} size wrong");
         assert_eq!(

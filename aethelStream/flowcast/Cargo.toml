@@ -29,6 +29,19 @@ write-skip       = []
 multi-gpu        = []
 # Pass-through: enables WriteBudgetManager SSD wear tracking in ramflow.
 ssd-wear         = ["ramflow/ssd-wear"]
+# Windows DirectStorage backend — wraps IDStorageQueue for zero-copy SSD reads.
+# Activates ramflow/direct-storage for probe + alloc helpers.
+# All DirectStorage code is #[cfg(target_os = "windows")] so this feature
+# compiles cleanly on Linux (used in CI: --features "mock-cuda,direct-storage").
+direct-storage   = ["ramflow/direct-storage"]
+
+[target.'cfg(windows)'.dependencies]
+# Raw Windows API bindings for the DirectStorage COM queue (feature = "direct-storage").
+# CreateEventW, WaitForSingleObject are used in backend/direct_storage.rs.
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
 
 [[bench]]
 name    = "flowcast_bench"

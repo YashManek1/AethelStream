@@ -72,6 +72,35 @@ use crate::cuda_bridge::bindings::{
 use crate::{RamFlowError, Result};
 
 // ===========================================================================
+// AllocKind -- deallocation discriminant
+// ===========================================================================
+
+/// Distinguishes how a [`PinnedBuffer`] was allocated, so [`Drop`] calls the
+/// correct deallocation function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocKind {
+    /// Allocated with `posix_memalign` / `_aligned_malloc`.
+    Standard,
+    /// Allocated with `mmap(MAP_PRIVATE|MAP_ANONYMOUS)` + `MADV_HUGEPAGE`.
+    /// Only constructible via [`PinnedBuffer::alloc_pinned_huge`] on Linux.
+    #[cfg(all(feature = "hugepages", target_os = "linux"))]
+    Huge {
+        /// Length for `munmap` -- rounded-up mmap size, not original `size_bytes`.
+        mmap_size: usize,
+    },
+    /// Allocated with `mmap(MAP_PRIVATE|MAP_ANONYMOUS)` + `madvise(MADV_SEQUENTIAL)`.
+    /// NOT registered with `cudaHostRegister` — DMA requires a pinned staging copy.
+    /// Only constructible via [`PinnedBuffer::alloc_mmap`] on Unix.
+    #[cfg(all(feature = "mmap-fallback", unix))]
+    Mmap {
+        /// Length for `munmap` — matches `size_bytes`.
+        mmap_size: usize,
+    },
+}
+
+
+
+// ===========================================================================
 // Platform-specific aligned allocator
 // ===========================================================================
 
@@ -230,6 +259,9 @@ pub struct PinnedBuffer {
     /// Set via [`PinnedBuffer::set_compressed`]; read by Module 5 to decide
     /// whether to decompress before using the buffer as a gradient checkpoint.
     compressed: bool,
+
+    /// How this buffer was allocated; governs which free function Drop calls.
+    alloc_kind: AllocKind,
 }
 
 // Safety: PinnedBuffer wraps a raw pointer that was allocated by posix_memalign
@@ -292,6 +324,7 @@ impl PinnedBuffer {
             size_bytes: bytes,
             is_mapped: false,
             compressed: false,
+            alloc_kind: AllocKind::Standard,
         })
     }
 
@@ -333,6 +366,7 @@ impl PinnedBuffer {
             size_bytes: bytes,
             is_mapped: true,
             compressed: false,
+            alloc_kind: AllocKind::Standard,
         })
     }
 
@@ -379,7 +413,64 @@ impl PinnedBuffer {
             size_bytes: bytes,
             is_mapped: false,
             compressed: false,
+            alloc_kind: AllocKind::Standard,
         })
+    }
+
+    /// Allocate `bytes` of hugepage-backed pinned memory.
+    ///
+    /// On Linux with the `hugepages` feature, allocates via `mmap(MAP_PRIVATE|MAP_ANONYMOUS)`,
+    /// calls `madvise(MADV_HUGEPAGE)` to request transparent hugepages, and pins with
+    /// `cudaHostRegister`.  `size_bytes` stores the caller-requested size;
+    /// `AllocKind::Huge { mmap_size }` stores the 2 MiB-aligned `munmap` length.
+    ///
+    /// Falls back to [`PinnedBuffer::alloc`] when hugepages are unavailable
+    /// (non-Linux platforms, or `mmap` OOM failure).
+    ///
+    /// # Errors
+    /// Same as [`PinnedBuffer::alloc`]: `AllocationFailed` or `CudaError`.
+    #[cfg(feature = "hugepages")]
+    pub fn alloc_pinned_huge(bytes: usize) -> Result<Self> {
+        if bytes == 0 {
+            return Err(RamFlowError::AllocationFailed(
+                "zero-size PinnedBuffer (huge) requested".into(),
+            ));
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use crate::allocator::huge::linux;
+
+            match linux::mmap_huge(bytes) {
+                Ok((ptr, mmap_size)) => {
+                    // SAFETY: ptr is non-null, mmap-backed; mmap_size >= bytes.
+                    unsafe {
+                        cuda_host_register(
+                            ptr as *mut c_void,
+                            bytes,
+                            CUDA_HOST_REGISTER_DEFAULT,
+                        )
+                        .inspect_err(|_| {
+                            // SAFETY: exact ptr + mmap_size from mmap_huge.
+                            linux::munmap_huge(ptr, mmap_size);
+                        })?;
+                    }
+                    return Ok(Self {
+                        ptr,
+                        size_bytes: bytes,
+                        is_mapped: false,
+                        compressed: false,
+                        alloc_kind: AllocKind::Huge { mmap_size },
+                    });
+                }
+                Err(_) => {
+                    // mmap failed (OOM / VA exhaustion): fall through to standard alloc.
+                }
+            }
+        }
+
+        // Non-Linux or mmap fallback.
+        Self::alloc(bytes)
     }
 
     /// Returns `true` if the buffer address is page-aligned (4096-byte boundary).
@@ -390,6 +481,51 @@ impl PinnedBuffer {
     #[inline]
     pub fn is_page_aligned(&self) -> bool {
         (self.ptr as usize).is_multiple_of(4096)
+    }
+
+    /// Allocate `bytes` of mmap-backed memory with sequential-access hints.
+    ///
+    /// This buffer is NOT page-locked. `cudaHostRegister` is not called.
+    /// DMA must go through a pinned staging buffer (see `ZeroCopyRouter`).
+    /// `is_pinned()` returns `false`.
+    ///
+    /// On Windows, always returns `RamFlowError::ConfigError`.
+    ///
+    /// # Errors
+    /// - `RamFlowError::AllocationFailed` if `bytes == 0` or `mmap` fails.
+    /// - `RamFlowError::ConfigError` on non-Unix platforms.
+    #[cfg(feature = "mmap-fallback")]
+    pub fn alloc_mmap(bytes: usize) -> Result<Self> {
+        if bytes == 0 {
+            return Err(RamFlowError::AllocationFailed(
+                "zero-size mmap-backed PinnedBuffer requested".into(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use crate::allocator::mmap_tier::MmapBuffer;
+            // Allocate via the mmap_tier helper; extract the raw pointer.
+            let mut temp = MmapBuffer::alloc_mmap(bytes)?;
+            let ptr = temp.as_mut_ptr();
+            // Prevent MmapBuffer's Drop from running — we take ownership of ptr here.
+            // SAFETY: We own the mmap allocation; we will call munmap in our own Drop.
+            std::mem::forget(temp);
+            Ok(Self {
+                ptr,
+                size_bytes: bytes,
+                is_mapped: false,
+                compressed: false,
+                alloc_kind: AllocKind::Mmap { mmap_size: bytes },
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = bytes;
+            Err(RamFlowError::ConfigError(
+                "mmap-fallback is not supported on Windows; \
+                 use a Linux or macOS system".into(),
+            ))
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -445,6 +581,21 @@ impl PinnedBuffer {
         self.is_mapped
     }
 
+    /// Returns `true` if this buffer is page-locked (registered with `cudaHostRegister`).
+    ///
+    /// Standard and Huge allocations are always pinned.  An `alloc_mmap`-backed
+    /// buffer returns `false`; DMA must go through a pinned staging copy.
+    ///
+    /// `ZeroCopyRouter::route` checks this flag before selecting a transfer strategy.
+    #[inline]
+    pub fn is_pinned(&self) -> bool {
+        match self.alloc_kind {
+            #[cfg(all(feature = "mmap-fallback", unix))]
+            AllocKind::Mmap { .. } => false,
+            _ => true,
+        }
+    }
+
     /// Whether this buffer's content has been INT8-compressed (Sprint 5).
     ///
     /// When `true`, the bytes contain INT8-quantised activation checkpoints
@@ -464,6 +615,16 @@ impl PinnedBuffer {
     #[inline]
     pub fn set_compressed(&mut self, compressed: bool) {
         self.compressed = compressed;
+    }
+
+    /// Which allocator backs this buffer.
+    ///
+    /// `AllocKind::Standard` for `posix_memalign`-allocated buffers.
+    /// `AllocKind::Huge { mmap_size }` for hugepage-backed buffers (Linux,
+    /// feature `hugepages`).
+    #[inline]
+    pub fn alloc_kind(&self) -> AllocKind {
+        self.alloc_kind
     }
 
     /// Read-only byte slice over the entire buffer.
@@ -529,13 +690,34 @@ impl Drop for PinnedBuffer {
         //     Drop cannot propagate errors, and the only failure case is a
         //     programming error that should have been caught in tests.
         unsafe {
-            // Step 1: Release the CUDA driver's pin on these pages.
-            let _ = cuda_host_unregister(self.ptr as *mut c_void);
+            // Step 1: Release CUDA driver pin ONLY for pinned (non-mmap) allocations.
+            // Mmap buffers were never registered with cudaHostRegister.
+            // Mmap buffers were never registered with cudaHostRegister; skip unregister.
+            // matches! cannot contain #[cfg] attributes, so use separate cfg-gated lets.
+            #[cfg(all(feature = "mmap-fallback", unix))]
+            let is_mmap_backed = matches!(self.alloc_kind, AllocKind::Mmap { .. });
+            #[cfg(not(all(feature = "mmap-fallback", unix)))]
+            let is_mmap_backed = false;
+            if !is_mmap_backed {
+                let _ = cuda_host_unregister(self.ptr as *mut c_void);
+            }
 
-            // Step 2: Return the memory to the OS.
-            // Use platform::free_aligned — on Windows this calls _aligned_free
-            // (NOT libc::free, which would be UB for _aligned_malloc pointers).
-            platform::free_aligned(self.ptr);
+            // Step 2: Free using the correct allocator.
+            match self.alloc_kind {
+                AllocKind::Standard => {
+                    platform::free_aligned(self.ptr);
+                }
+                #[cfg(all(feature = "hugepages", target_os = "linux"))]
+                AllocKind::Huge { mmap_size } => {
+                    crate::allocator::huge::linux::munmap_huge(self.ptr, mmap_size);
+                }
+                #[cfg(all(feature = "mmap-fallback", unix))]
+                AllocKind::Mmap { mmap_size } => {
+                    // SAFETY: ptr and mmap_size are from alloc_mmap; not yet munmap'd.
+                    libc::munmap(self.ptr as *mut c_void, mmap_size);
+                }
+            }
         }
     }
 }
+

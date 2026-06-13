@@ -26,6 +26,12 @@ pub struct TensorInfo {
     pub shape: Vec<usize>,
     /// Data type string (e.g. `"f16"`, `"bf16"`, `"i8"`).
     pub dtype: String,
+    /// xxHash3-64 digest of this tensor's raw bytes on disk.
+    ///
+    /// `None` when `shard_index.json` does not include a `"xxh3"` field for this
+    /// tensor.  Populated by the `checksum_shard` binary or Module 1 at shard time.
+    /// Only verified when the `checksums` feature is active.
+    pub xxhash3: Option<u64>,
 }
 
 /// Central registry of every tensor in every layer, loaded from
@@ -120,6 +126,7 @@ impl TensorLocationDict {
                             byte_length: tensor_entry.byte_length,
                             shape: tensor_entry.shape,
                             dtype: tensor_entry.dtype,
+                            xxhash3: tensor_entry.xxhash3,
                         };
                         insert_tensor(&mut inner, grouped_layer.index, flattened, base_dir)?;
                     }
@@ -134,6 +141,7 @@ impl TensorLocationDict {
                             byte_length: tensor_entry.byte_length,
                             shape: tensor_entry.shape,
                             dtype: tensor_entry.dtype,
+                            xxhash3: tensor_entry.xxhash3,
                         };
                         insert_tensor(&mut inner, mapped_layer.index, flattened, base_dir)?;
                     }
@@ -179,6 +187,8 @@ struct TensorEntry {
     byte_length: usize,
     shape: Vec<usize>,
     dtype: String,
+    #[serde(rename = "xxh3", default)]
+    xxhash3: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,6 +201,8 @@ struct FlatTensorEntry {
     byte_length: usize,
     shape: Vec<usize>,
     dtype: String,
+    #[serde(rename = "xxh3", default)]
+    xxhash3: Option<u64>,
 }
 
 fn insert_tensor(
@@ -233,6 +245,7 @@ fn insert_tensor(
             byte_length: entry.byte_length,
             shape: entry.shape,
             dtype: entry.dtype,
+            xxhash3: entry.xxhash3,
         },
     );
     if previous.is_some() {

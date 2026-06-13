@@ -1,4 +1,4 @@
-// src/nvme/mod.rs — Direct NVMe I/O engine (Sprint 2)
+// src/nvme/mod.rs - Direct NVMe I/O engine (Sprint 2)
 //
 // This file wires together IoUringInstance, FdTable, and PrefetchEngine into
 // a single `DirectNvmeEngine` struct that the rest of ramflow uses.
@@ -27,6 +27,9 @@ pub mod write_budget;
 /// NVMe block-layer bypass via IORING_OP_URING_CMD (feature `nvme-passthrough`).
 #[cfg(feature = "nvme-passthrough")]
 pub mod passthrough;
+/// Windows DirectStorage backend: capability probe, COM queue, allocation helper.
+#[cfg(feature = "direct-storage")]
+pub mod direct_storage;
 
 pub use engine::DirectNvmeEngine;
 
@@ -36,7 +39,10 @@ mod engine {
     use std::sync::mpsc::{self, Receiver, SyncSender};
     use std::sync::{Arc, Mutex};
 
-    /// Number of completion queue entries — 2× SQ depth per io_uring convention.
+    #[cfg(feature = "checksums")]
+    use std::collections::HashMap;
+
+    /// Number of completion queue entries - 2× SQ depth per io_uring convention.
     const CQ_DEPTH: usize = 256;
 
     /// Completion channel capacity: 4× CQ depth gives ~1 s of headroom at peak CQE rate
@@ -52,6 +58,33 @@ mod engine {
         spawn_cqe_poller, CqeResult, PrefetchEngine, PrefetchToken, SuperShardConfig,
     };
     use crate::Result;
+
+    /// Pending checksum verification for one in-flight prefetch.
+    ///
+    /// Stored in `DirectNvmeEngine::checksum_registry` when `checksums` feature
+    /// is active. Erased from the registry after poll_completions() verifies it.
+    #[cfg(feature = "checksums")]
+    struct ChecksumEntry {
+        /// Pointer to the first byte of the destination buffer.
+        ///
+        /// # Safety
+        /// Points to pinned host memory allocated via `PinnedBuffer`. Pinned memory
+        /// is never moved by the allocator or the OS; the caller guarantees the
+        /// buffer lives until the corresponding completion token is drained.
+        ptr: *const u8,
+        /// Byte length of the destination buffer (must equal `TensorInfo.byte_length`).
+        len: usize,
+        /// Expected xxHash3-64 digest from `shard_index.json`.
+        expected: u64,
+        /// Shard file index � echoed into `RamFlowError::ShardCorrupted` on mismatch.
+        shard_id: u32,
+    }
+
+    /// Safety: `ptr` points to pinned host memory, which is never relocated.
+    /// The registry is guarded by a `Mutex`; only one thread touches an entry
+    /// at a time (producer: schedule path; consumer: poll_completions).
+    #[cfg(feature = "checksums")]
+    unsafe impl Send for ChecksumEntry {}
 
     // -----------------------------------------------------------------------
     // DirectNvmeEngine
@@ -101,7 +134,7 @@ mod engine {
         /// Sender side of the completion channel (held for poller thread spawn).
         completion_tx: SyncSender<CqeResult>,
 
-        /// Receiver side — callers read from this to get completion tokens.
+        /// Receiver side - callers read from this to get completion tokens.
         completion_rx: Receiver<CqeResult>,
 
         /// Handle for the CQE poller thread (None until start_cqe_poller() is called).
@@ -112,6 +145,13 @@ mod engine {
 
         /// Buffers backing prewarm reads until completions can retire them.
         prewarm_buffers: Mutex<Vec<PinnedBuffer>>,
+
+        /// Per-token checksum registry for post-read integrity verification.
+        ///
+        /// Populated by `prefetch_with_checksum()` when the caller provides an expected
+        /// xxHash3 digest. Drained by `poll_completions()` after each successful read.
+        #[cfg(feature = "checksums")]
+        checksum_registry: Arc<Mutex<HashMap<PrefetchToken, ChecksumEntry>>>,
     }
 
     impl DirectNvmeEngine {
@@ -124,7 +164,7 @@ mod engine {
         /// - Files opened with O_RDONLY | O_DIRECT | O_CLOEXEC on Linux.
         /// - io_uring ring sized to 128 SQEs / 256 CQEs.
         /// - SQPOLL attempted first; falls back to standard mode if unavailable.
-        /// - The CQE poller thread is NOT started here — call start_cqe_poller()
+        /// - The CQE poller thread is NOT started here - call start_cqe_poller()
         ///   after construction once you know which CPU core to pin it to.
         ///
         /// # Alternative: use open_with_paths() if shard paths don't follow
@@ -199,13 +239,15 @@ mod engine {
                 poller_handle: None,
                 stop_signal: Arc::new(AtomicBool::new(false)),
                 prewarm_buffers: Mutex::new(Vec::new()),
+                #[cfg(feature = "checksums")]
+                checksum_registry: Arc::new(Mutex::new(HashMap::new())),
             })
         }
 
         /// Start the CQE poller thread pinned to `cpu_core`.
         ///
         /// Must be called before the engine receives any prefetch results.
-        /// Can only be called once — subsequent calls return Ok(()) immediately.
+        /// Can only be called once - subsequent calls return Ok(()) immediately.
         pub fn start_cqe_poller(&mut self, cpu_core: usize) -> Result<()> {
             if self.poller_handle.is_some() {
                 return Ok(());
@@ -231,7 +273,7 @@ mod engine {
         ///
         /// # O_DIRECT alignment requirement
         /// `byte_offset` must be a multiple of 512. This is enforced by
-        /// Module 1 when sharding — the engine does not re-check it here
+        /// Module 1 when sharding - the engine does not re-check it here
         /// (checking would add a branch to the critical path).
         pub fn prefetch(
             &self,
@@ -247,6 +289,44 @@ mod engine {
                 .schedule(shard_id, byte_offset, length, dst, token)
         }
 
+        /// Submit an async read for `shard_id`, optionally registering an xxHash3
+        /// checksum for post-read verification.
+        ///
+        /// When `expected_xxh3` is `Some(digest)`, `poll_completions()` will verify
+        /// the received bytes against `digest` before returning the token to the
+        /// caller.  A mismatch returns `Err(RamFlowError::ShardCorrupted)`.
+        ///
+        /// When `expected_xxh3` is `None`, this is identical to `prefetch()`.
+        ///
+        /// # Availability
+        /// Only available with the `checksums` feature. Use `prefetch()` for the
+        /// non-checksummed fast path.
+        #[cfg(feature = "checksums")]
+        pub fn prefetch_with_checksum(
+            &self,
+            shard_id: u32,
+            byte_offset: u64,
+            length: u64,
+            dst: &PinnedBuffer,
+            token: PrefetchToken,
+            expected_xxh3: Option<u64>,
+        ) -> Result<()> {
+            if let Some(expected) = expected_xxh3 {
+                let entry = ChecksumEntry {
+                    ptr: dst.as_ptr(),
+                    len: dst.len(),
+                    expected,
+                    shard_id,
+                };
+                let mut registry = self
+                    .checksum_registry
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                registry.insert(token, entry);
+            }
+            self.prefetch(shard_id, byte_offset, length, dst, token)
+        }
+
         /// Drain the completion channel and return all available results.
         ///
         /// Non-blocking: returns immediately with whatever completions are
@@ -256,16 +336,37 @@ mod engine {
         /// Returns the number of CQEs processed.
         pub fn poll_completions(&self) -> Result<u32> {
             let mut count = 0u32;
-            // try_recv() is non-blocking — returns Err(Empty) when no CQEs available.
+            // try_recv() is non-blocking - returns Err(Empty) when no CQEs available.
             while let Ok(cqe_result) = self.completion_rx.try_recv() {
-                // In Sprint 2, we just count completions.
-                // Sprint 3 adds routing to the layer readiness state machine.
                 if cqe_result.result < 0 {
                     // Negative result = errno. Convert to IoUringError.
                     return Err(RamFlowError::IoUringError(
                         std::io::Error::from_raw_os_error(-cqe_result.result),
                     ));
                 }
+
+                #[cfg(feature = "checksums")]
+                {
+                    let mut registry = self
+                        .checksum_registry
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    if let Some(entry) = registry.remove(&cqe_result.token) {
+                        // Safety: ptr points to pinned host memory allocated by PinnedBuffer;
+                        // pinned memory is never relocated.  The caller guarantees the buffer
+                        // lives until this completion token is drained from the channel.
+                        let received = unsafe { std::slice::from_raw_parts(entry.ptr, entry.len) };
+                        let computed = xxhash_rust::xxh3::xxh3_64(received);
+                        if computed != entry.expected {
+                            return Err(RamFlowError::ShardCorrupted {
+                                shard_id: entry.shard_id,
+                                expected: entry.expected,
+                                got: computed,
+                            });
+                        }
+                    }
+                }
+
                 count += 1;
             }
             Ok(count)
@@ -287,7 +388,7 @@ mod engine {
 
         /// Pre-warm the pool by issuing background reads for the first `n` shards.
         ///
-        /// Called when `hardware_profile.json` exists (Idea 9 — Shard Pre-Warming).
+        /// Called when `hardware_profile.json` exists (Idea 9 - Shard Pre-Warming).
         /// Uses the same io_uring ring as regular prefetch.
         /// Sprint 3 implementation.
         pub fn prewarm_first_n(&self, n: u32) -> Result<()> {
@@ -390,7 +491,7 @@ mod engine {
 
         /// Returns true only when the ring has fully drained and pressure is gone.
         ///
-        /// The co-scheduler must call this — not just check `is_paused()` — to
+        /// The co-scheduler must call this - not just check `is_paused()` - to
         /// confirm it is safe to resume submissions. Pressure is relieved only when
         /// `outstanding_reads + claimed_slots ≤ pressure_threshold` AND the pause
         /// signal is clear.
@@ -415,7 +516,7 @@ mod engine {
         /// Mirrors what `spawn_cqe_poller` does when a real kernel completion arrives,
         /// allowing tests to drive the channel without io_uring or hardware. Pass a
         /// negative `result` to simulate a failed read (e.g., `-5` for EIO).
-        #[cfg(test)]
+        #[cfg(any(test, feature = "checksums"))]
         pub fn inject_completion_for_test(&self, token: PrefetchToken, result: i32) {
             self.completion_tx.send(CqeResult { token, result }).ok();
         }
@@ -428,7 +529,7 @@ mod engine {
 
             // Join the poller thread (wait for clean exit).
             if let Some(handle) = self.poller_handle.take() {
-                // Ignore join errors — if the thread panicked, we're already
+                // Ignore join errors - if the thread panicked, we're already
                 // in a degraded state and there is nothing useful to do here.
                 let _ = handle.join();
             }
@@ -490,7 +591,7 @@ mod engine {
                     result: 1,
                 })
                 .unwrap_or_else(|_| {
-                    panic!("channel stalled at entry {index} — capacity regression below 256")
+                    panic!("channel stalled at entry {index} - capacity regression below 256")
                 });
             }
         }
@@ -507,7 +608,7 @@ mod engine {
         }
 
         /// A CQE with result < 0 must surface as Err(IoUringError) from poll_completions().
-        /// This proves the negative-CQE guard is reachable and working — a failed read
+        /// This proves the negative-CQE guard is reachable and working - a failed read
         /// must never be delivered as valid bytes to Module 3.
         #[test]
         fn error_cqe_propagates_through_poll_completions() {
@@ -542,6 +643,82 @@ mod engine {
 
             let b = rx.recv().unwrap();
             assert_eq!(b.token, 99);
+        }
+        #[test]
+        #[cfg(feature = "checksums")]
+        fn checksum_matching_digest_passes() {
+            let engine = DirectNvmeEngine::open_with_paths(&[]).expect("engine init");
+
+            // Build a known buffer and compute its xxh3.
+            let data: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+            let expected = xxhash_rust::xxh3::xxh3_64(&data);
+
+            // Allocate a pinned buffer and copy data into it.
+            let mut buf = PinnedBuffer::alloc(4096).expect("alloc");
+            buf.as_mut_slice().copy_from_slice(&data);
+
+            // Register the checksum.
+            engine
+                .prefetch_with_checksum(0, 0, 4096, &buf, /*token=*/ 1u64, Some(expected))
+                .expect("prefetch_with_checksum");
+
+            // Inject a successful CQE (result=4096 bytes read).
+            engine.inject_completion_for_test(1u64, 4096);
+
+            // poll_completions must succeed - the checksum matches.
+            let completed = engine.poll_completions().expect("poll_completions");
+            assert_eq!(completed, 1, "one completion must be returned");
+        }
+
+        #[test]
+        #[cfg(feature = "checksums")]
+        fn checksum_corruption_detection() {
+            let engine = DirectNvmeEngine::open_with_paths(&[]).expect("engine init");
+
+            let data: Vec<u8> = vec![0xABu8; 512];
+            let expected = xxhash_rust::xxh3::xxh3_64(&data);
+
+            let mut buf = PinnedBuffer::alloc(512).expect("alloc");
+            buf.as_mut_slice().copy_from_slice(&data);
+
+            engine
+                .prefetch_with_checksum(7, 0, 512, &buf, /*token=*/ 2u64, Some(expected))
+                .expect("prefetch_with_checksum");
+
+            // Corrupt one byte after registration to simulate a mid-transfer bit-flip.
+            buf.as_mut_slice()[0] ^= 0xFF;
+
+            engine.inject_completion_for_test(2u64, 512);
+
+            let outcome = engine.poll_completions();
+            match outcome {
+                Err(RamFlowError::ShardCorrupted {
+                    shard_id,
+                    expected: exp,
+                    got,
+                }) => {
+                    assert_eq!(shard_id, 7);
+                    assert_eq!(exp, expected);
+                    assert_ne!(got, expected, "got must differ from expected on corruption");
+                }
+                other => panic!("expected ShardCorrupted, got {other:?}"),
+            }
+        }
+
+        #[test]
+        #[cfg(feature = "checksums")]
+        fn checksum_none_skips_verification() {
+            let engine = DirectNvmeEngine::open_with_paths(&[]).expect("engine init");
+            let buf = PinnedBuffer::alloc(512).expect("alloc");
+
+            engine
+                .prefetch_with_checksum(0, 0, 512, &buf, /*token=*/ 3u64, None)
+                .expect("prefetch_with_checksum");
+
+            engine.inject_completion_for_test(3u64, 512);
+
+            let completed = engine.poll_completions().expect("poll_completions");
+            assert_eq!(completed, 1);
         }
     }
 }

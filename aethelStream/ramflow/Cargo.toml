@@ -39,6 +39,37 @@ io-uring-use-split = []
 # Uses blocking pread/pwrite on the submission path and emits normal completions.
 libaio-fallback = []
 
+# Hugepage-backed pinned memory for large training buffers (>= 2 MiB).
+# Uses mmap(MAP_PRIVATE|MAP_ANONYMOUS) + madvise(MADV_HUGEPAGE) on Linux.
+# Falls back to standard posix_memalign on non-Linux or on mmap failure.
+hugepages = []
+
+# NUMA-aware pool allocation via mbind(MPOL_BIND).  Binds DMA buffers to the
+# GPU's NUMA node to minimise cross-node PCIe traffic.  No-op on single-socket
+# consumer hardware where /sys numa_node reads -1.
+numa = []
+
+# LZ4-compressed eviction tier for Recomputation-window layers.
+# Uses lz4_flex (pure Rust, no C FFI).  Zero SSD TBW; decompression at
+# 4-5 GB/s/core outpaces consumer NVMe reads on most low-RAM workstations.
+lz4-cache = ["dep:lz4_flex"]
+
+# mmap-backed pool slots for graceful degradation on 16-32 GB machines.
+# When the pre-flight RAM budget check fails, pool slots are allocated via
+# mmap(MAP_PRIVATE|MAP_ANONYMOUS) + madvise(MADV_SEQUENTIAL) instead of
+# cudaHostRegister'd pinned memory. DMA uses a pinned staging copy (~2-4x slower).
+# On Windows, slot construction returns RamFlowError::ConfigError("not supported").
+mmap-fallback = []
+
+# xxHash3 per-shard integrity verification. Runs on the poll_completions() path
+# after each successful NVMe read. ~30 GB/s throughput overhead is negligible vs NVMe.
+checksums = ["dep:xxhash-rust"]
+
+# Windows DirectStorage backend — zero-copy SSD→GPU reads via IDStorageQueue.
+# Requires Windows 10 20H1+ and the DirectStorage runtime DLLs at runtime.
+# Compatible with mock-cuda; DirectStorage code is #[cfg(target_os = "windows")].
+direct-storage = []
+
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
@@ -59,10 +90,17 @@ serde_json = "1"
 
 # Idea 4: SSD delta compression (zstd).  Only compiled when ssd-wear is active.
 zstd       = { version = "0.13", optional = true }
+lz4_flex  = { version = "0.11", optional = true }
+
+# Per-shard xxHash3 integrity verification (feature = "checksums")
+xxhash-rust = { version = "0.8", optional = true, features = ["xxh3"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [
-    "Win32_System_Memory"
+    "Win32_System_Memory",
+    "Win32_Foundation",            # HRESULT, HANDLE, CloseHandle, WAIT_OBJECT_0
+    "Win32_System_LibraryLoader",  # LoadLibraryW, GetProcAddress, FreeLibrary
+    "Win32_System_Threading",      # CreateEventW, WaitForSingleObject
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -82,3 +120,8 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "ramflow_bench"
 harness = false
+
+[[bin]]
+name              = "checksum_shard"
+path              = "src/bin/checksum_shard.rs"
+required-features = ["checksums"]

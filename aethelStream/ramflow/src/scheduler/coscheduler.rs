@@ -1,4 +1,4 @@
-// src/scheduler/coscheduler.rs — CoScheduler + PerLayerScaleTable
+﻿// src/scheduler/coscheduler.rs — CoScheduler + PerLayerScaleTable
 //
 // Sprint 4: full implementation replacing Sprint 0 stub.
 //
@@ -281,32 +281,6 @@ fn configured_gradient_window_len() -> usize {
         .unwrap_or(50)
 }
 
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn gradient_variance_uses_windowed_mean_instead_of_raw_last_spike() {
-        let mut table = PerLayerScaleTable::new(2, 0.05);
-
-        for _ in 0..49 {
-            table.update_gradient_variance(1, 1.0);
-        }
-        table.update_gradient_variance(1, 101.0);
-
-        let smoothed = table.gradient_variance(1);
-        assert!(
-            smoothed < 101.0,
-            "windowed gradient variance should smooth the raw last spike"
-        );
-        assert!(
-            (smoothed - 3.0).abs() < 0.001,
-            "expected mean of 49 baseline samples and one spike, got {smoothed}"
-        );
-        assert_eq!(table.gradient_variance(0), 0.0);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // CoScheduler
@@ -462,5 +436,32 @@ impl CoScheduler {
     /// Uses `Ordering::Acquire` to observe the `Release` store from the pressure callback.
     pub fn should_compress_checkpoints(&self) -> bool {
         self.compress_trigger.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gradient_variance_uses_windowed_mean_instead_of_raw_last_spike() {
+        let mut table = PerLayerScaleTable::new(2, 0.05);
+
+        for _ in 0..49 {
+            table.update_gradient_variance(1, 1.0);
+        }
+        table.update_gradient_variance(1, 101.0);
+
+        let smoothed = table.gradient_variance(1);
+        assert!(
+            smoothed < 101.0,
+            "windowed gradient variance should smooth the raw last spike"
+        );
+        assert!(
+            (smoothed - 3.0).abs() < 0.001,
+            "expected mean of 49 baseline samples and one spike, got {smoothed}"
+        );
+        assert_eq!(table.gradient_variance(0), 0.0);
     }
 }

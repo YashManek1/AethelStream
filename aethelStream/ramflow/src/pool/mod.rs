@@ -2,6 +2,9 @@
 //
 // Sprint 3A: PoolSlot upgraded to real RAII; PoolRegistry re-exported from subpools.
 
+/// LZ4-compressed eviction tier (feature = "lz4-cache").
+#[cfg(feature = "lz4-cache")]
+pub mod eviction_cache;
 /// Lock-free ring buffer with atomic claim/release and phase-fence resize.
 pub mod ring_buffer;
 /// Slab packer: merges co-traveling small tensors into one pinned allocation.
@@ -13,6 +16,8 @@ pub mod subpools;
 /// `TensorLocationDict`: maps `(layer, name)` → on-disk shard location.
 pub mod tensor_location;
 
+#[cfg(feature = "lz4-cache")]
+pub use eviction_cache::{CachePrecision, EvictionCache, Lz4CacheTelemetry};
 pub use ring_buffer::RingBuffer;
 pub use slab::TensorSlab;
 pub use subpools::{EmbeddingFallbackMode, PoolRegistry, SlabInitMode};

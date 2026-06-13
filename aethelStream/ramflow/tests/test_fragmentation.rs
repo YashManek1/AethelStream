@@ -1,4 +1,4 @@
-// tests/test_fragmentation.rs — Sprint 2 fragmentation / stability test
+﻿// tests/test_fragmentation.rs — Sprint 2 fragmentation / stability test
 
 use ramflow::PinnedBuffer;
 
@@ -15,7 +15,7 @@ fn vm_rss_kb() -> Option<u64> {
 
 #[test]
 fn test_fragmentation_stability_80_layers_x_10_passes() {
-    let baseline_rss = {
+    let _baseline_rss = {
         #[cfg(target_os = "linux")]
         {
             vm_rss_kb().unwrap_or(0)

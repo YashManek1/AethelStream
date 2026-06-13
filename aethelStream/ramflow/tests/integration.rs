@@ -1,4 +1,4 @@
-// tests/integration.rs — Sprint 6 Module 2 end-to-end integration test
+﻿// tests/integration.rs — Sprint 6 Module 2 end-to-end integration test
 //
 // Covers:
 //   - TensorLocationDict build for a synthetic model
@@ -13,7 +13,7 @@
 // Run with:
 //   cargo test --no-default-features --features mock-cuda integration -- --nocapture
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -93,7 +93,7 @@ fn test_integration_module2_full_streaming_cycle() {
     remove_temp_dir(&tmp_dir);
 }
 
-fn run_integration_body(profile_path: &PathBuf) {
+fn run_integration_body(profile_path: &Path) {
     // =========================================================================
     // 1. TensorLocationDict for a synthetic 3-layer model
     // =========================================================================
@@ -114,7 +114,7 @@ fn run_integration_body(profile_path: &PathBuf) {
 
     let warmup_config = WarmupConfig {
         steps: 3,
-        output_path: profile_path.clone(),
+        output_path: profile_path.to_path_buf(),
         model_sha256: [0u8; 32],
     };
     let profiler = WarmupProfiler::new(warmup_config).expect("WarmupProfiler::new");
@@ -181,7 +181,7 @@ fn run_integration_body(profile_path: &PathBuf) {
     let transition_count_clone = Arc::clone(&transition_count);
     use ramflow::phase::classifier::TrainingPhase;
     let classifier = DefaultPhaseClassifier::with_transition_callback(
-        profile_path.clone(),
+        profile_path.to_path_buf(),
         Arc::new(move |_previous_phase, _next_phase| {
             transition_count_clone.fetch_add(1, Ordering::AcqRel);
         }),

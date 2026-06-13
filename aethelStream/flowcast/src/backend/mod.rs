@@ -3,6 +3,7 @@
 //! FlowCast drives one backend at a time.  The backend selection runs at
 //! startup and is not changed at runtime.
 
+pub mod direct_storage;
 pub mod file_read;
 pub mod gds;
 pub mod mock;
@@ -103,11 +104,10 @@ pub struct BackendCapabilities {
 
 /// Probe system capabilities and return the best available backend.
 ///
-/// Priority: GDS (`gds` feature + hardware) → SuperShard (io_uring, Linux)
-///           → Uring (Linux) → MockBackend (fallback / mock-cuda).
+/// Priority: DirectStorage (Windows) → GDS → SuperShard/Uring → Mock.
 ///
 /// `override_name` forces a specific backend: `"gds"`, `"super-shard"`,
-/// `"uring"`, or `"mock"`.
+/// `"uring"`, `"direct-storage"`, or `"mock"`.
 pub fn select_backend(
     shard_dir: &std::path::Path,
     num_shards: u32,
@@ -115,7 +115,9 @@ pub fn select_backend(
     select_backend_with_override(shard_dir, num_shards, None)
 }
 
-/// Select backend with an optional name override (`"gds"`, `"super-shard"`, `"uring"`, `"mock"`).
+/// Select backend with an optional name override.
+///
+/// Accepted values: `"gds"`, `"super-shard"`, `"uring"`, `"direct-storage"`, `"mock"`.
 pub fn select_backend_with_override(
     shard_dir: &std::path::Path,
     num_shards: u32,
@@ -138,6 +140,13 @@ pub fn select_backend_with_override(
                 super_shard::SuperShardConfig::default(),
             )));
         }
+        #[cfg(feature = "direct-storage")]
+        Some("direct-storage") => {
+            // No shard paths known at override time; backend degrades to ReadFile
+            // fallback with an empty path list (usable for capability probing).
+            let backend = direct_storage::DirectStorageBackend::new(Vec::new());
+            return Ok(Box::new(backend));
+        }
         Some(other) => {
             return Err(crate::FlowCastError::Config(format!(
                 "unknown backend override '{other}'"
@@ -146,7 +155,19 @@ pub fn select_backend_with_override(
         None => {}
     }
 
-    // Auto-detect: GDS → SuperShard/Uring → Mock
+    // Auto-detect: DirectStorage (Windows) → GDS → SuperShard/Uring → Mock
+
+    #[cfg(feature = "direct-storage")]
+    {
+        let shard_paths: Vec<std::path::PathBuf> = (0..num_shards)
+            .map(|index| shard_dir.join(format!("shard_{index:04}.bin")))
+            .collect();
+        let ds = direct_storage::DirectStorageBackend::new(shard_paths);
+        if ds.is_using_direct_storage() {
+            return Ok(Box::new(ds));
+        }
+    }
+
     #[cfg(feature = "gds")]
     if let Ok(backend) = gds::GdsBackend::new() {
         return Ok(Box::new(backend));

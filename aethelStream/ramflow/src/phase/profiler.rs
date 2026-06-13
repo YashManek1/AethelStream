@@ -1,4 +1,4 @@
-// src/phase/profiler.rs — warm-up profiler and access-pattern profiler
+﻿// src/phase/profiler.rs — warm-up profiler and access-pattern profiler
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -137,6 +137,28 @@ impl WarmupProfiler {
         Ok(1)
     }
 
+    /// Probe whether hugepage-backed allocation is available on this machine.
+    ///
+    /// Attempts one `alloc_pinned_huge(2 MiB)` allocation and drops it.
+    /// On non-Linux or without the `hugepages` feature, returns `false`.
+    fn probe_hugepages_available(&self) -> bool {
+        #[cfg(all(feature = "hugepages", target_os = "linux"))]
+        {
+            crate::allocator::PinnedBuffer::alloc_pinned_huge(
+                crate::allocator::huge::HUGEPAGE_THRESHOLD,
+            )
+            .map(|buf| {
+                // Verify AllocKind::Huge was used (not a fallback to Standard).
+                matches!(buf.alloc_kind(), crate::allocator::AllocKind::Huge { .. })
+            })
+            .unwrap_or(false)
+        }
+        #[cfg(not(all(feature = "hugepages", target_os = "linux")))]
+        {
+            false
+        }
+    }
+
     fn simulate_mini_step(&self) {
         {
             let _attention = self.record_pool_claim(ProfilePhase::Forward, LayerKind::Attention);
@@ -202,6 +224,8 @@ impl WarmupProfiler {
         #[cfg(not(all(feature = "nvme-passthrough", target_os = "linux")))]
         let nvme_passthrough = false;
 
+        let hugepages_available = self.probe_hugepages_available();
+
         let cache = HardwareProfileCache {
             model_sha256: hex_encode(&self.config.model_sha256),
             zero_copy_threshold_bytes: self.measure_zero_copy_crossover()?,
@@ -209,6 +233,8 @@ impl WarmupProfiler {
             backward: CachedPhaseProfile::from_profile(&profiles[1]),
             recomputation: CachedPhaseProfile::from_profile(&profiles[2]),
             nvme_passthrough,
+            hugepages_available,
+            hugepage_threshold_bytes: default_hugepage_threshold_bytes(),
         };
         let json = serde_json::to_vec_pretty(&cache).map_err(|serialize_error| {
             RamFlowError::ConfigError(format!(
@@ -354,6 +380,16 @@ struct HardwareProfileCache {
     /// Defaults to `false` when loading profiles written before this field existed.
     #[serde(default)]
     nvme_passthrough: bool,
+    /// Written by the hugepage capability probe (feature `hugepages`, Linux only).
+    /// `true` when `mmap + MADV_HUGEPAGE` succeeded for a 2 MiB test buffer.
+    /// Defaults to `false` when loading profiles written before this field existed.
+    #[serde(default)]
+    hugepages_available: bool,
+    /// Pool routing threshold written by the hugepage probe.
+    /// Ring-buffer slots >= this byte count use hugepage allocation.
+    /// Defaults to 2 MiB.
+    #[serde(default = "default_hugepage_threshold_bytes")]
+    hugepage_threshold_bytes: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -420,6 +456,10 @@ fn estimated_peak_bytes(attention: u32, mlp: u32, norm: u32, embedding: u32) -> 
 
 fn default_zero_copy_threshold_bytes() -> usize {
     4 * 1024 * 1024
+}
+
+fn default_hugepage_threshold_bytes() -> usize {
+    2 * 1024 * 1024
 }
 
 fn estimated_zero_copy_score(size_bytes: usize) -> usize {
