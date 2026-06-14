@@ -32,6 +32,16 @@ impl MockBackend {
         }
     }
 
+    /// Inject a completion directly into the pending queue.
+    ///
+    /// Allows tests to simulate error CQEs (negative `result`) without an
+    /// actual NVMe device or io_uring ring.  Not intended for production use.
+    #[doc(hidden)]
+    pub fn inject_completion_for_test(&self, token: u64, result: i32) {
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        pending.push(Completion { token, result });
+    }
+
     /// Return a copy of the last bytes written for `shard_id`, or `None` if
     /// no write has been submitted for that shard.
     ///

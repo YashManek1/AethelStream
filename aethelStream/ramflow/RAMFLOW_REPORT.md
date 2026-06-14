@@ -1,11 +1,12 @@
 # RamFlow: System Memory Orchestration for AethelStream
 ## Full Technical Report — Module 2 Reference Document
 
-**Version:** Post-Sprint Hardening + Seven Production-Hardening Extensions (complete)
-**Date:** 2026-06-13
+**Version:** Post-Sprint Hardening + Eight Production-Hardening Extensions (complete)
+**Date:** 2026-06-14
 **Test status:** 112 passing (mock-cuda + hugepages + numa); 91 passing (mock-cuda + checksums standalone); 0 failing across any feature combination
 **Feature flags:** `mock-cuda`, `ssd-wear`, `hugepages`, `numa`, `nvme-passthrough`, `lz4-cache`, `mmap-fallback`, `checksums`, `direct-storage` (Windows)
 **Clippy:** 0 warnings, 0 errors (`-D warnings`) across all feature combinations
+**New in this revision:** `AllocKind::External`, `PinnedBuffer::external_view()`, `CqeErrorKind`, `classify_cqe_error()`, `RamFlowError::MediaError` — added in support of FlowCast A11 (CQE retry).
 
 ---
 
@@ -162,8 +163,20 @@ Windows path:
 | `Huge` | `mmap + MADV_HUGEPAGE` + `cudaHostRegister` | `cudaHostUnregister` + `munmap(mmap_size)` | Yes |
 | `Mmap` | `mmap + MADV_SEQUENTIAL` | `munmap` | **No** |
 | `PageAligned` | `_aligned_malloc(4096)` (Windows DS path) | `_aligned_free` | Yes |
+| `External` | Caller-owned memory (no allocation) | **No-op** — caller owns lifetime | Caller's responsibility |
 
 `PinnedBuffer::alloc(size)` selects `Posix` unconditionally. `PinnedBuffer::alloc_huge(size)` selects `Huge` when `feature = "hugepages"` and the platform is Linux. `PinnedBuffer::alloc_page_aligned(size)` selects `PageAligned` for NVMe passthrough (PRP mode) and DirectStorage.
+
+**`AllocKind::External` and `PinnedBuffer::external_view(ptr, size)`** (added in CQE retry sprint):
+
+`External` represents a borrowed, non-owning view over memory allocated and managed by a caller. `Drop` is a strict no-op: no `cudaHostUnregister`, no `free`, no `munmap`. The invariant is that the caller guarantees the pointed-to memory remains live for the entire lifetime of the `External` view.
+
+```rust
+/// Safety: `ptr` must be non-null and valid for `size` bytes for the lifetime of the view.
+pub unsafe fn external_view(ptr: *mut u8, size: usize) -> PinnedBuffer;
+```
+
+Primary use: `CqeRetryBackend` in FlowCast stores the raw dst pointer from an in-flight `PendingRead`. When a retry is due, it reconstructs `&PinnedBuffer` via `external_view` to call `inner.prefetch(...)` without double-freeing the underlying `PoolSlot`. The `PoolSlot` is alive because no terminal completion has been forwarded to `route_completions` for that token.
 
 **Drop contract for Huge:** `Drop` must call `munmap(ptr, mmap_size)` where `mmap_size` is the **rounded-up** length returned by `mmap_huge(size)`, not the original `size`. The distinction matters when `size` is not a multiple of 2 MiB: `mmap_size = round_to_huge(size) >= size`. Calling `munmap(ptr, size)` on a hugepage buffer is undefined behaviour — the kernel expects the exact length from `mmap(2)`.
 
@@ -397,6 +410,44 @@ Attempts to open `/dev/ng0n1` (first NVMe character device) and query the namesp
 - Buffer alignment < 4096 bytes.
 - `probe_passthrough_capability()` returns `Unavailable`.
 The training loop never sees a passthrough-specific error.
+
+#### 3.3.6 CQE Error Classification (`nvme/mod.rs`)
+
+Added in support of FlowCast's `CqeRetryBackend` (A11). Re-exported from the crate root.
+
+**`CqeErrorKind`:**
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CqeErrorKind {
+    Transient,       // EINTR(4), EAGAIN(11), EBUSY(16) — retry eligible
+    MediaError,      // EIO(5), ENODEV(19) — surface immediately
+    Unknown(i32),    // any other negative errno — surface immediately
+}
+```
+
+**`classify_cqe_error(res: i32) -> CqeErrorKind`:**
+
+Maps a raw CQE `result` field (negative errno from io_uring) to the above enum.
+
+```rust
+pub fn classify_cqe_error(res: i32) -> CqeErrorKind {
+    match -res {
+        4 | 11 | 16 => CqeErrorKind::Transient,
+        5 | 19      => CqeErrorKind::MediaError,
+        n           => CqeErrorKind::Unknown(n),
+    }
+}
+```
+
+**`RamFlowError::MediaError`:**
+```rust
+#[error("media error on shard {shard_id}: errno {errno}")]
+MediaError { shard_id: u32, errno: i32 }
+```
+
+Raised by FlowCast's `CqeRetryBackend` when a CQE error is classified as `MediaError` or when the
+Transient retry budget is exhausted. The caller (training loop) should log the shard ID and abort
+the current training step; a cold restart re-reads from the same shard.
 
 ---
 
@@ -1106,14 +1157,17 @@ cargo doc --no-default-features --features "mock-cuda,lz4-cache,mmap-fallback,ch
 ```rust
 // Crate root re-exports
 use ramflow::{
-    PinnedBuffer,           // page-locked exact-size buffer (Posix / Huge / PageAligned)
+    PinnedBuffer,           // page-locked exact-size buffer (Posix / Huge / PageAligned / External)
     PoolRegistry,           // central pool router
     DirectNvmeEngine,       // io_uring NVMe engine (+ checksum registry)
     MemoryPressureGauge,    // sampling pressure sensor
     CoScheduler,            // pressure-reactive scheduler
     PerLayerScaleTable,     // per-layer EWA loss scaler
     TensorSlab,             // small-tensor packing slab
-    Result, RamFlowError,   // crate error type
+    Result, RamFlowError,   // crate error type (incl. MediaError)
+    // CQE error classification (for CqeRetryBackend in FlowCast A11)
+    CqeErrorKind,           // Transient / MediaError / Unknown(i32)
+    classify_cqe_error,     // classify_cqe_error(res: i32) -> CqeErrorKind
 };
 
 // New top-level re-exports (production-hardening extensions)
@@ -1182,11 +1236,24 @@ impl NvmePassthroughEngine {
 impl PinnedBuffer {
     pub fn alloc_page_aligned(size: usize) -> Result<Self>;  // 4096-byte aligned
     pub fn is_page_aligned(&self) -> bool;                   // addr % 4096 == 0
+    /// Non-owning view. `Drop` is a no-op; caller owns the memory.
+    /// Safety: `ptr` valid for `size` bytes for entire lifetime of the view.
+    pub unsafe fn external_view(ptr: *mut u8, size: usize) -> Self;
 }
 #[cfg(all(feature = "hugepages", target_os = "linux"))]
 impl PinnedBuffer {
     pub fn alloc_huge(size: usize) -> Result<Self>;  // mmap + MADV_HUGEPAGE
 }
+
+// CQE error classification (always available, no feature gate)
+pub fn classify_cqe_error(res: i32) -> CqeErrorKind;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CqeErrorKind { Transient, MediaError, Unknown(i32) }
+
+// RamFlowError — new variant
+// #[error("media error on shard {shard_id}: errno {errno}")]
+// MediaError { shard_id: u32, errno: i32 }
 
 // EvictionCache (lz4-cache)
 impl EvictionCache {
@@ -1218,4 +1285,5 @@ pub fn mbind_buffer(ptr: *mut u8, size: usize, node: u32) -> bool;  // returns f
 
 *RamFlow Module 2 — AethelStream research project*
 *112 tests pass (hugepages + numa). 91 tests pass (checksums). 0 clippy warnings. Public API frozen.*
-*Last updated: 2026-06-13. Seven production-hardening extensions complete.*
+*Last updated: 2026-06-14. Eight production-hardening extensions complete.*
+*New in this revision: `AllocKind::External`, `PinnedBuffer::external_view()`, `CqeErrorKind`, `classify_cqe_error()`, `RamFlowError::MediaError` (CQE retry support for FlowCast A11).*

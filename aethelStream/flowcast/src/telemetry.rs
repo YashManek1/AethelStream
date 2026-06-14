@@ -1,11 +1,11 @@
 //! Cross-cutting metrics counters — sampled lock-light by the completion router.
 //!
 //! All counters are `AtomicU64` (Relaxed ordering — best-effort gauges).
-//! `snapshot()` produces a `TelemetrySnapshot` for the paper's JSON dump via
+//! `snapshot()` produces a `TelemetrySnapshot` for the paper''s JSON dump via
 //! `to_json()`.
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -28,7 +28,6 @@ pub struct TelemetrySnapshot {
     pub hotset_hits: u64,
     /// Hot-set cache misses (layer not resident, I/O issued).
     pub hotset_misses: u64,
-    // --- new fields ---
     /// Bytes read from NVMe (sum of all completed prefetch lengths).
     pub nvme_bytes_read: u64,
     /// Current io_uring submission-queue depth (snapshot).
@@ -48,6 +47,28 @@ pub struct TelemetrySnapshot {
     /// Instantaneous NVMe read throughput (MB/s), populated by
     /// `Telemetry::record_nvme_throughput_mbps` (T-a fix).
     pub nvme_throughput_mbps: f32,
+    /// Latest SSD composite temperature from SMART telemetry (Celsius).
+    ///
+    /// 0.0 when the `ssd-thermal` feature is inactive or no reading has yet
+    /// succeeded (SMART ioctl failed or no device).
+    #[serde(default)]
+    pub ssd_temp_celsius: f32,
+    /// Latest thermal state: 0 = Normal, 1 = Warm, 2 = Throttling.
+    ///
+    /// 0 when the `ssd-thermal` feature is inactive.
+    #[serde(default)]
+    pub thermal_state: u8,
+    /// Total background re-profiling jobs spawned by the thermal monitor (A3-T).
+    ///
+    /// 0 when the `ssd-thermal` feature is inactive.
+    #[serde(default)]
+    pub reprofiling_events: u64,
+    /// Total CQE errors that were classified as Transient and re-submitted.
+    #[serde(default)]
+    pub retry_count: u64,
+    /// Total CQE errors that exhausted retries or were classified as MediaError/Unknown.
+    #[serde(default)]
+    pub media_error_count: u64,
 }
 
 impl TelemetrySnapshot {
@@ -111,7 +132,17 @@ pub struct Telemetry {
     write_skip_count: Arc<AtomicU64>,
     write_submitted: Arc<AtomicU64>,
     /// Instantaneous NVMe throughput stored as f32 bits (T-a fix).
-    nvme_throughput_mbps_bits: Arc<std::sync::atomic::AtomicU32>,
+    nvme_throughput_mbps_bits: Arc<AtomicU32>,
+    /// Latest SSD temperature stored as f32 bits (Relaxed — best-effort gauge).
+    ssd_temp_celsius_bits: Arc<AtomicU32>,
+    /// Latest thermal state as u8: 0 = Normal, 1 = Warm, 2 = Throttling.
+    thermal_state_u8: Arc<AtomicU8>,
+    /// Total thermal re-profiling events spawned (A3-T).
+    reprofiling_events: Arc<AtomicU64>,
+    /// CQE errors classified as Transient and retried.
+    retry_count: Arc<AtomicU64>,
+    /// CQE errors that exhausted retries or were MediaError/Unknown.
+    media_error_count: Arc<AtomicU64>,
     /// Timestamp of the last `on_layer_start` call (for idle-gap measurement).
     last_layer_start: Arc<std::sync::Mutex<Option<Instant>>>,
 }
@@ -135,7 +166,12 @@ impl Telemetry {
             decode_ns: Arc::new(AtomicU64::new(0)),
             write_skip_count: Arc::new(AtomicU64::new(0)),
             write_submitted: Arc::new(AtomicU64::new(0)),
-            nvme_throughput_mbps_bits: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            nvme_throughput_mbps_bits: Arc::new(AtomicU32::new(0)),
+            ssd_temp_celsius_bits: Arc::new(AtomicU32::new(0)),
+            thermal_state_u8: Arc::new(AtomicU8::new(0)),
+            reprofiling_events: Arc::new(AtomicU64::new(0)),
+            retry_count: Arc::new(AtomicU64::new(0)),
+            media_error_count: Arc::new(AtomicU64::new(0)),
             last_layer_start: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -228,6 +264,33 @@ impl Telemetry {
         self.write_submitted.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Update SSD temperature and thermal state from the thermal monitor (A3-T).
+    ///
+    /// Called from `on_layer_start` at each successful SMART read.
+    /// `state_u8`: 0 = Normal, 1 = Warm, 2 = Throttling.
+    pub fn record_thermal_state(&self, temp_celsius: f32, state_u8: u8) {
+        self.ssd_temp_celsius_bits.store(temp_celsius.to_bits(), Ordering::Relaxed);
+        self.thermal_state_u8.store(state_u8, Ordering::Relaxed);
+    }
+
+    /// Synchronise the cumulative reprofile-events count from the thermal monitor.
+    ///
+    /// Uses a Store (not fetch_add) because the thermal monitor owns the
+    /// authoritative counter; this mirrors it for snapshot serialisation.
+    pub fn set_reprofiling_events(&self, count: u64) {
+        self.reprofiling_events.store(count, Ordering::Relaxed);
+    }
+
+    /// Record one CQE retry (Transient error, retry budget not yet exhausted).
+    pub fn record_cqe_retry(&self) {
+        self.retry_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one terminal CQE failure (MediaError, Unknown, or retries exhausted).
+    pub fn record_media_error(&self) {
+        self.media_error_count.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Snapshot all counters atomically (best-effort — no global lock).
     pub fn snapshot(&self) -> TelemetrySnapshot {
         TelemetrySnapshot {
@@ -249,6 +312,13 @@ impl Telemetry {
             nvme_throughput_mbps: f32::from_bits(
                 self.nvme_throughput_mbps_bits.load(Ordering::Relaxed),
             ),
+            ssd_temp_celsius: f32::from_bits(
+                self.ssd_temp_celsius_bits.load(Ordering::Relaxed),
+            ),
+            thermal_state: self.thermal_state_u8.load(Ordering::Relaxed),
+            reprofiling_events: self.reprofiling_events.load(Ordering::Relaxed),
+            retry_count: self.retry_count.load(Ordering::Relaxed),
+            media_error_count: self.media_error_count.load(Ordering::Relaxed),
         }
     }
 }

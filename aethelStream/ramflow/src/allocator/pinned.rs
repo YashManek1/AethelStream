@@ -96,6 +96,14 @@ pub enum AllocKind {
         /// Length for `munmap` — matches `size_bytes`.
         mmap_size: usize,
     },
+
+    /// Borrowed external memory — owned by the caller; [`Drop`] is a no-op.
+    ///
+    /// Only constructible via [`PinnedBuffer::external_view`].  Used by the
+    /// CQE retry path to reconstruct a temporary `PinnedBuffer` reference from
+    /// the raw pointer stored in `PendingRead` without double-freeing the
+    /// underlying pinned memory.
+    External,
 }
 
 
@@ -658,6 +666,28 @@ impl PinnedBuffer {
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.ptr
     }
+
+    /// Creates a non-owning view over an externally-managed byte region.
+    ///
+    /// The caller guarantees that `ptr` is valid for `size` bytes for the
+    /// entire lifetime of the returned `PinnedBuffer`. `Drop` is a no-op for
+    /// `AllocKind::External` buffers; the backing memory is never freed here.
+    ///
+    /// # Safety
+    /// `ptr` must be non-null, properly aligned, and valid for `size` reads
+    /// and writes for at least as long as the returned buffer is alive. The
+    /// caller owns the memory and must free it after the view is dropped.
+    pub unsafe fn external_view(ptr: *mut u8, size: usize) -> Self {
+        Self {
+            ptr,
+            size_bytes: size,
+            // External views are not CUDA-mapped (no cudaHostRegisterMapped).
+            is_mapped: false,
+            // External views never contain compressed checkpoint data.
+            compressed: false,
+            alloc_kind: AllocKind::External,
+        }
+    }
 }
 
 // ===========================================================================
@@ -666,6 +696,11 @@ impl PinnedBuffer {
 
 impl Drop for PinnedBuffer {
     fn drop(&mut self) {
+        // External views are non-owning borrows: skip unregistration and deallocation.
+        if matches!(self.alloc_kind, AllocKind::External) {
+            return;
+        }
+
         // ⚠️  ORDERING: cudaHostUnregister MUST be called BEFORE libc::free.
         //
         //     Why: If we call libc::free first, the OS may immediately reuse
@@ -716,6 +751,8 @@ impl Drop for PinnedBuffer {
                     // SAFETY: ptr and mmap_size are from alloc_mmap; not yet munmap'd.
                     libc::munmap(self.ptr as *mut c_void, mmap_size);
                 }
+                // External views return early above; this arm satisfies exhaustiveness.
+                AllocKind::External => {}
             }
         }
     }

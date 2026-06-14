@@ -48,6 +48,10 @@ struct FlowCastSection {
     /// Selected from {2,4,6,8,12} minimising T_iter
     checkpoint_freq: u32,
     layer_plan: Vec<LayerTiming>,
+    /// Optimal super-shard size from the A3 latency-vs-size curve probe (bytes).
+    /// `0` = not yet measured.
+    #[serde(default)]
+    optimal_super_shard_bytes: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -73,6 +77,11 @@ impl Profiler {
 
     /// Profile `num_layers` model layers (5 representative samples).
     ///
+    /// After the standard 5-layer A3 pass, runs an additional
+    /// latency-vs-size curve probe to determine the optimal super-shard
+    /// transfer size (the I/O "knee").  Both results are merged into
+    /// `hardware_profile.json`.
+    ///
     /// Returns immediately on a SHA-256 cache hit (shard_index.json unchanged).
     ///
     /// # Errors
@@ -96,7 +105,11 @@ impl Profiler {
         let w_max = compute_w_max(mean_t_ssd, profile.mean_forward_ms);
         let freq = select_checkpoint_freq(mean_t_ssd, profile.mean_forward_ms, num_layers);
 
-        let section = to_section(&profile, &sha256_hex, w_max, freq);
+        // A3-ext: latency-vs-size curve → optimal super-shard byte budget.
+        let latency_curve = measure_transfer_latency_curve(&self.shard_dir);
+        let optimal_bytes = find_knee(&latency_curve) as u64;
+
+        let section = to_section(&profile, &sha256_hex, w_max, freq, optimal_bytes);
         merge_section(&self.shard_dir.join("hardware_profile.json"), &section)?;
         self.profile = Some(profile.clone());
         Ok(profile)
@@ -158,7 +171,7 @@ impl Profiler {
         let profile = self.profile.as_ref().ok_or_else(|| {
             FlowCastError::ProfileIo("save called before finalize or warmup".into())
         })?;
-        let section = to_section(profile, "", 0, 1);
+        let section = to_section(profile, "", 0, 1, profile.optimal_super_shard_bytes);
         merge_section(&self.shard_dir.join("hardware_profile.json"), &section)
     }
 
@@ -231,6 +244,22 @@ pub fn select_checkpoint_freq(t_ssd_ms: f32, t_gpu_ms: f32, num_layers: u32) -> 
         .unwrap_or(4)
 }
 
+/// Run a re-profiling timing probe on `layer_indices` using the same A3 method.
+///
+/// Returns `(mean_t_ssd_ms, w_max)` without persisting to `hardware_profile.json`.
+/// Called from the thermal monitor background re-profiling thread (`ssd-thermal` feature).
+///
+/// Falls back to mock constants under `cfg(feature = "mock-cuda")`.
+pub fn probe_layers(shard_dir: &std::path::Path, layer_indices: &[u32]) -> (f32, u32) {
+    let timings: Vec<LayerTiming> = layer_indices
+        .iter()
+        .map(|&idx| measure_layer(idx, shard_dir))
+        .collect();
+    let mean_t_ssd = mean_f32(timings.iter().map(|t| t.transfer_ms));
+    let mean_t_gpu = mean_f32(timings.iter().map(|t| t.forward_ms));
+    (mean_t_ssd, compute_w_max(mean_t_ssd, mean_t_gpu))
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -297,6 +326,7 @@ fn build_profile(timings: &[LayerTiming]) -> HardwareProfile {
         mean_backward_ms: mean_f32(timings.iter().map(|t| t.backward_ms)),
         sample_count: timings.len() as u32,
         layer_plan: timings.to_vec(),
+        optimal_super_shard_bytes: 0,
     }
 }
 
@@ -305,6 +335,7 @@ fn to_section(
     sha256_hex: &str,
     w_max: u32,
     checkpoint_freq: u32,
+    optimal_super_shard_bytes: u64,
 ) -> FlowCastSection {
     FlowCastSection {
         model_sha256: sha256_hex.to_string(),
@@ -317,6 +348,7 @@ fn to_section(
         w_max,
         checkpoint_freq,
         layer_plan: profile.layer_plan.clone(),
+        optimal_super_shard_bytes,
     }
 }
 
@@ -329,6 +361,7 @@ fn from_section(s: &FlowCastSection) -> HardwareProfile {
         mean_backward_ms: s.mean_backward_ms,
         sample_count: s.sample_count,
         layer_plan: s.layer_plan.clone(),
+        optimal_super_shard_bytes: s.optimal_super_shard_bytes,
     }
 }
 
@@ -453,4 +486,126 @@ fn mean_f32(iter: impl Iterator<Item = f32>) -> f32 {
     let mut n = 0u32;
     for v in iter { sum += v as f64; n += 1; }
     if n == 0 { 0.0 } else { (sum / n as f64) as f32 }
+}
+
+// ── A3-ext: latency-vs-size curve and super-shard knee detection ───────────
+
+/// Transfer sizes probed during the latency-vs-size curve measurement.
+/// Covers the range where PCIe 4 NVMe typically exhibits its bandwidth knee
+/// (4–16 MiB for consumer drives under sequential load).
+pub const LATENCY_PROBE_SIZES: &[usize] = &[
+    256 * 1024,        //  256 KiB
+    512 * 1024,        //  512 KiB
+    1024 * 1024,       //    1 MiB
+    2 * 1024 * 1024,   //    2 MiB
+    4 * 1024 * 1024,   //    4 MiB
+    8 * 1024 * 1024,   //    8 MiB
+    16 * 1024 * 1024,  //   16 MiB
+    32 * 1024 * 1024,  //   32 MiB
+];
+
+/// Simulated per-I/O fixed overhead (queue submission + DMA setup), in µs.
+#[cfg(feature = "mock-cuda")]
+const MOCK_IO_OVERHEAD_US: f64 = 100.0;
+
+/// Simulate one read of `size_bytes` bytes from `shard_dir`.
+///
+/// Under `mock-cuda`: linear latency model — `overhead + size / bandwidth`.
+/// Under real hardware: would issue an io_uring SQE and time the CQE.
+fn simulate_one_read(size_bytes: usize) -> std::time::Duration {
+    #[cfg(feature = "mock-cuda")]
+    {
+        // bandwidth in bytes/µs: MOCK_NVME_BW_GBS * 1e9 / 1e6 = MOCK_NVME_BW_GBS * 1000
+        let bw_bytes_per_us: f64 = MOCK_NVME_BW_GBS as f64 * 1_000.0;
+        let transfer_us = size_bytes as f64 / bw_bytes_per_us;
+        let total_us = MOCK_IO_OVERHEAD_US + transfer_us;
+        std::time::Duration::from_micros(total_us as u64)
+    }
+    #[cfg(not(feature = "mock-cuda"))]
+    {
+        // Real path: time an alloc proxy for now (full io_uring integration is
+        // reserved for the Linux `ssd-thermal` sprint).
+        let start = std::time::Instant::now();
+        let _buf = vec![0u8; size_bytes];
+        start.elapsed()
+    }
+}
+
+/// Return the median of three reads for `size_bytes`.
+fn median_of_three_reads(_shard_dir: &Path, size_bytes: usize) -> std::time::Duration {
+    let mut samples = [
+        simulate_one_read(size_bytes),
+        simulate_one_read(size_bytes),
+        simulate_one_read(size_bytes),
+    ];
+    samples.sort();
+    samples[1]
+}
+
+/// Measure the io_uring latency-vs-size curve across [`LATENCY_PROBE_SIZES`].
+///
+/// Returns a `Vec<(size_bytes, median_duration)>` sorted by size.  Each entry
+/// is the median of three reads at that transfer size.
+///
+/// Called once at warm-up (after the 5-layer A3 pass) and again by
+/// [`probe_knee_near`] on thermal throttling events.
+pub fn measure_transfer_latency_curve(shard_dir: &Path) -> Vec<(usize, std::time::Duration)> {
+    LATENCY_PROBE_SIZES
+        .iter()
+        .map(|&size| (size, median_of_three_reads(shard_dir, size)))
+        .collect()
+}
+
+/// Find the latency-vs-size "knee": the first transfer size where increasing
+/// the size yields less than 5 % additional throughput.
+///
+/// **Definition**: knee = first `size[k]` where
+/// `throughput(size[k+1]) < throughput(size[k]) * 1.05`.
+///
+/// Returns the last (largest) size if throughput keeps improving across the
+/// entire probe range, or a 4 MiB default when `curve` is empty.
+pub fn find_knee(curve: &[(usize, std::time::Duration)]) -> usize {
+    if curve.is_empty() {
+        return 4 * 1024 * 1024;
+    }
+    // throughput in bytes/µs at each probe point.
+    let throughputs: Vec<f64> = curve
+        .iter()
+        .map(|&(size, dur)| {
+            let us = dur.as_micros().max(1) as f64;
+            size as f64 / us
+        })
+        .collect();
+
+    for k in 0..throughputs.len().saturating_sub(1) {
+        if throughputs[k + 1] < throughputs[k] * 1.05 {
+            return curve[k].0;
+        }
+    }
+    curve.last().map(|&(size, _)| size).unwrap_or(4 * 1024 * 1024)
+}
+
+/// Re-run the latency probe for the ± 2 sizes around the current knee.
+///
+/// Called by the thermal monitor when SSD throttling is detected (M3-New-3).
+/// Avoids a full 8-point sweep by constraining the probe to the region most
+/// likely to contain the shifted knee.
+///
+/// Returns the new knee size in bytes.
+pub fn probe_knee_near(shard_dir: &Path, current_knee_bytes: usize) -> usize {
+    // Locate the current knee in the global probe table.
+    let current_idx = LATENCY_PROBE_SIZES
+        .iter()
+        .position(|&s| s >= current_knee_bytes)
+        .unwrap_or(LATENCY_PROBE_SIZES.len() / 2);
+
+    let lo = current_idx.saturating_sub(2);
+    let hi = (current_idx + 2).min(LATENCY_PROBE_SIZES.len() - 1);
+
+    let narrow_curve: Vec<(usize, std::time::Duration)> = LATENCY_PROBE_SIZES[lo..=hi]
+        .iter()
+        .map(|&size| (size, median_of_three_reads(shard_dir, size)))
+        .collect();
+
+    find_knee(&narrow_curve)
 }

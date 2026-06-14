@@ -1,4 +1,4 @@
-// benches/flowcast_bench.rs — FlowCast (M3) + RamFlow (M2) combined benchmarks
+﻿// benches/flowcast_bench.rs — FlowCast (M3) + RamFlow (M2) combined benchmarks
 //
 // Run: cargo bench --features mock-cuda
 //      cargo bench --features mock-cuda -- <filter>  (run subset)
@@ -16,9 +16,10 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use flowcast::{
     backend::mock::MockBackend,
-    config::Precision,
+    config::{LayerTiming, Precision},
     decode::QuantizedDecoder,
     priority::{PriorityQueue, PrefetchRequest},
+    scheduler::{DuplexBudget, EdfScheduler, DEFAULT_READ_FRACTION},
     state_machine::PrefetchStateMachine,
     window::AdaptiveWindow,
 };
@@ -442,8 +443,127 @@ fn bench_pressure_response(c: &mut Criterion) {
     group.finish();
 }
 
+
+// ---------------------------------------------------------------------------
+// Benchmark 9: EDF scheduler — sort_by_deadline hot path vs scalar window
+// Compares EDF-ordered submission against sequential ordering under mixed
+// shard sizes (INT4 middle layers 4x smaller than FP16 edge layers).
+// ---------------------------------------------------------------------------
+
+fn bench_edf_scheduler(c: &mut Criterion) {
+    let mut group = c.benchmark_group("edf");
+
+    let make_plan = || -> Vec<LayerTiming> {
+        (0u32..5)
+            .map(|i| {
+                let bytes = if i % 2 == 0 { 256u64 * 1024 * 1024 } else { 64 * 1024 * 1024 };
+                LayerTiming {
+                    layer_idx: i * 8,
+                    forward_ms: 8.0,
+                    backward_ms: 16.0,
+                    shard_bytes: bytes,
+                    transfer_ms: 0.0,
+                    pcie_transfer_ms: 0.0,
+                }
+            })
+            .collect()
+    };
+
+    // EDF sort for a W=8 mixed-size window (hot path per layer in training loop).
+    group.bench_function("sort_window_8_mixed_sizes", |b| {
+        let plan = make_plan();
+        let sched = EdfScheduler::new(&plan, 12.0, 40);
+        b.iter(|| {
+            let mut targets: Vec<u32> = (1u32..=8).collect();
+            sched.sort_by_deadline(black_box(&mut targets));
+            black_box(targets);
+        });
+    });
+
+    // Scalar window fallback (EDF not available — no profiler data).
+    group.bench_function("sort_window_8_scalar_fallback", |b| {
+        let sched = EdfScheduler::new(&[], 12.0, 40);
+        b.iter(|| {
+            let mut targets: Vec<u32> = (1u32..=8).collect();
+            sched.sort_by_deadline(black_box(&mut targets));
+            black_box(targets);
+        });
+    });
+
+    // EDF sort for a W=16 window (wider lookahead, still bounded by A2).
+    group.throughput(Throughput::Elements(16));
+    group.bench_function("sort_window_16_mixed_sizes", |b| {
+        let plan = make_plan();
+        let sched = EdfScheduler::new(&plan, 12.0, 80);
+        b.iter(|| {
+            let mut targets: Vec<u32> = (1u32..=16).collect();
+            sched.sort_by_deadline(black_box(&mut targets));
+            black_box(targets);
+        });
+    });
+
+    // EDF construction cost from a 5-sample layer_plan (called once per warmup).
+    group.bench_function("construction_from_5_sample_plan", |b| {
+        let plan = make_plan();
+        b.iter(|| {
+            black_box(EdfScheduler::new(
+                black_box(&plan),
+                black_box(12.0_f32),
+                black_box(80u32),
+            ));
+        });
+    });
+
+    group.finish();
+}
+fn bench_token_bucket(c: &mut Criterion) {
+    let mut group = c.benchmark_group("token_bucket");
+    group.throughput(Throughput::Elements(1));
+
+    // take_read on a full bucket — hot path per prefetch SQE.
+    group.bench_function("take_read_full_bucket", |b| {
+        let budget = DuplexBudget::new(3.0, DEFAULT_READ_FRACTION, 1.0);
+        let read_cap = budget.read_cap();
+        b.iter(|| {
+            // Refill before each iteration so the bucket never exhausts.
+            budget.refill_by_elapsed_us(black_box(100.0));
+            let _ = budget.take_read(black_box((read_cap / 1000) as u64));
+        });
+    });
+
+    // take_write on a full bucket — hot path per optimizer write-back.
+    group.bench_function("take_write_full_bucket", |b| {
+        let budget = DuplexBudget::new(3.0, DEFAULT_READ_FRACTION, 1.0);
+        let write_cap = budget.write_cap();
+        b.iter(|| {
+            budget.refill_by_elapsed_us(black_box(100.0));
+            let _ = budget.take_write(black_box((write_cap / 1000) as u64));
+        });
+    });
+
+    // refill_by_elapsed_us — called once per on_layer_start (not in loop).
+    group.bench_function("refill_1ms", |b| {
+        let budget = DuplexBudget::new(3.0, DEFAULT_READ_FRACTION, 0.0);
+        b.iter(|| {
+            budget.refill_by_elapsed_us(black_box(1_000.0));
+        });
+    });
+
+    // take_read failure (exhausted bucket) — measures CAS loop cost on contention.
+    group.bench_function("take_read_exhausted", |b| {
+        let budget = DuplexBudget::new(3.0, DEFAULT_READ_FRACTION, 0.0);
+        b.iter(|| {
+            let _ = black_box(budget.take_read(black_box(1024)));
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_token_bucket,
+    bench_edf_scheduler,
     bench_window,
     bench_priority,
     bench_decode,

@@ -27,9 +27,12 @@
 
 use super::file_read::FileReadBackend;
 use super::{BackendCapabilities, Completion, IoBackend};
-use crate::{FlowCastError, Result};
+use crate::Result;
+#[cfg(all(target_os = "windows", feature = "direct-storage"))]
+use crate::FlowCastError;
 use ramflow::PinnedBuffer;
 use std::path::PathBuf;
+#[cfg(all(target_os = "windows", feature = "direct-storage"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // ---------------------------------------------------------------------------

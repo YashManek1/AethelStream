@@ -1,4 +1,4 @@
-//! A4/A9: Delayed write-back scheduler and gradient-threshold write-skip.
+﻿//! A4/A9: Delayed write-back scheduler and gradient-threshold write-skip.
 //!
 //! `on_weights_updated(i, src, lr_grad_norm)` enqueues a background
 //! `write_async` for layer `i` overlapped with the SSD read of layer `i−2`
@@ -16,13 +16,24 @@
 //!
 //! All writes are routed through `WriteBudgetManager::enqueue_write` (ssd-wear
 //! feature) before calling `IoBackend::write_async`.
+//!
+//! # DuplexBudget integration (A5-DB)
+//! When a [`DuplexBudget`] is installed via [`WritebackScheduler::set_duplex_budget`],
+//! `on_weights_updated` checks write-token availability before each SQE.  On
+//! exhaustion the write is pushed to an internal `deferred_writes` queue.
+//! [`drain_deferred`] is called by the [`crate::FlowCast`] facade at the start
+//! of every `on_layer_start` so deferred writes fire as soon as bandwidth tokens
+//! are refilled.
+//!
+//! [`drain_deferred`]: WritebackScheduler::drain_deferred
 
 use crate::backend::IoBackend;
+use crate::scheduler::DuplexBudget;
 use crate::telemetry::Telemetry;
 use crate::{FlowCastError, Result};
 use ramflow::nvme::write_budget::WriteBudgetManager;
 use ramflow::PinnedBuffer;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -56,6 +67,24 @@ pub struct PendingWrite {
     pub byte_offset: u64,
     /// Byte length.
     pub byte_length: u64,
+}
+
+// ---------------------------------------------------------------------------
+// DeferredWrite (internal)
+// ---------------------------------------------------------------------------
+
+/// A write-back deferred because the [`DuplexBudget`] write-token bucket was exhausted.
+///
+/// Stores an owned copy of the source bytes so the original `PinnedBuffer`
+/// can be freed immediately.  The copy is re-pinned when [`WritebackScheduler::drain_deferred`]
+/// submits the write.
+struct DeferredWrite {
+    /// Layer index whose optimizer state was updated.
+    layer_idx: u32,
+    /// Byte offset in the shard file (512-byte aligned per `O_DIRECT`).
+    byte_offset: u64,
+    /// Owned copy of the layer weight bytes to write.
+    data: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +142,18 @@ pub struct WritebackScheduler {
     budget: WriteBudgetManager,
     /// Optional telemetry handle; wired via `set_telemetry` (T-b fix).
     telemetry: Option<Arc<Telemetry>>,
+    /// Duplex bandwidth token bucket (shared with the prefetch state machine).
+    ///
+    /// When `Some`, `on_weights_updated` checks write-token availability before
+    /// submitting any SQE.  Exhausted writes are pushed to `deferred_writes`.
+    duplex_budget: Option<Arc<DuplexBudget>>,
+    /// Write-backs deferred because `duplex_budget` write tokens were exhausted.
+    ///
+    /// Drained by [`drain_deferred`] at the start of each `on_layer_start`
+    /// after the token bucket has been refilled.
+    ///
+    /// [`drain_deferred`]: WritebackScheduler::drain_deferred
+    deferred_writes: VecDeque<DeferredWrite>,
 }
 
 impl WritebackScheduler {
@@ -137,12 +178,27 @@ impl WritebackScheduler {
             inflight: Arc::new(AtomicU32::new(0)),
             budget,
             telemetry: None,
+            duplex_budget: None,
+            deferred_writes: VecDeque::new(),
         }
     }
 
     /// Wire a telemetry handle so write-skip and write-submit events are counted (T-b fix).
     pub fn set_telemetry(&mut self, telemetry: Arc<Telemetry>) {
         self.telemetry = Some(telemetry);
+    }
+
+    /// Wire the duplex bandwidth token bucket (shared with
+    /// [`crate::state_machine::PrefetchStateMachine`]).
+    ///
+    /// Call once during [`crate::FlowCast`] construction.  The write-token
+    /// bucket must have tokens available before `on_weights_updated` submits
+    /// any SQE. On exhaustion, writes are pushed to the internal deferred queue
+    /// and flushed by [`drain_deferred`] at the start of the next layer step.
+    ///
+    /// [`drain_deferred`]: WritebackScheduler::drain_deferred
+    pub fn set_duplex_budget(&mut self, budget: Arc<DuplexBudget>) {
+        self.duplex_budget = Some(budget);
     }
 
     // ------------------------------------------------------------------
@@ -155,10 +211,12 @@ impl WritebackScheduler {
     /// `src` = updated weight buffer in pinned RAM.
     /// `byte_offset` / `byte_length` = location in the shard file.
     ///
-    /// Write-skip logic:
-    /// 1. If `lr_grad_norm < skip_threshold` AND skip-rate budget not exhausted
-    ///    → accumulate delta, return without writing.
-    /// 2. Else → submit `write_async` if in-flight cap allows; otherwise block.
+    /// Write ordering:
+    /// 1. Gradient-skip check — skip if norm below threshold and skip-rate budget allows.
+    /// 2. DuplexBudget check — defer to `deferred_writes` if write tokens exhausted.
+    /// 3. In-flight count cap — drain completions until below `max_inflight_writes`.
+    /// 4. WriteBudgetManager — charge SSD wear budget.
+    /// 5. `write_async` — submit the SQE.
     ///
     /// # Errors
     /// `FlowCastError::BackendIo` on submission failure.
@@ -178,7 +236,7 @@ impl WritebackScheduler {
         let new_delta = current_delta + lr_grad_norm;
         self.accumulated_delta.insert(layer_idx, new_delta);
 
-        // Decide whether to skip.
+        // Decide whether to skip (A9 gradient-threshold skip).
         let skip_rate_ok = self.skip_rate_headroom() > 0;
         let should_skip = new_delta < self.config.skip_threshold && skip_rate_ok;
 
@@ -193,10 +251,25 @@ impl WritebackScheduler {
         // Clear accumulated delta — we are writing now.
         self.accumulated_delta.insert(layer_idx, 0.0);
 
+        // DuplexBudget write-token check (A5-DB): defer when write bandwidth is exhausted
+        // so burst write-backs cannot starve EDF-scheduled prefetch reads.
+        // Must happen BEFORE the inflight count check (the count cap is a concurrency
+        // guard; the token bucket is a bandwidth guarantee — both must pass).
+        if let Some(ref budget) = self.duplex_budget {
+            if budget.take_write(byte_length).is_err() {
+                self.deferred_writes.push_back(DeferredWrite {
+                    layer_idx,
+                    byte_offset,
+                    data: src.as_slice().to_vec(),
+                });
+                return Ok(());
+            }
+        }
+
         // Respect in-flight write cap (prevents read starvation).
         self.wait_for_inflight_slot(backend)?;
 
-        // Route through WriteBudgetManager (no-op when ssd-wear inactive).
+        // Route through WriteBudgetManager (no-op when ssd-wear feature inactive).
         self.budget.enqueue_write(layer_idx, src).map_err(|e| {
             FlowCastError::BackendIo(format!("write budget: {e}"))
         })?;
@@ -210,6 +283,69 @@ impl WritebackScheduler {
         if let Err(error) = backend.write_async(layer_idx, byte_offset, byte_length, src, token) {
             self.inflight.fetch_sub(1, Ordering::AcqRel);
             return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Drain write-backs deferred because the [`DuplexBudget`] write-token bucket was exhausted.
+    ///
+    /// Called by [`crate::FlowCast::on_layer_start`] immediately after the token bucket
+    /// has been refilled (via [`crate::scheduler::DuplexBudget::refill`] in the state
+    /// machine).  Flushes as many deferred writes as the current write-token budget allows,
+    /// stopping as soon as tokens run out.  Remaining deferred writes stay in the queue.
+    ///
+    /// If no [`DuplexBudget`] is installed, all deferred writes are flushed unconditionally.
+    ///
+    /// # Errors
+    /// `FlowCastError::BackendIo` on the first submission failure.  Remaining deferred
+    /// writes stay in the queue for the next [`drain_deferred`] call.
+    ///
+    /// [`drain_deferred`]: WritebackScheduler::drain_deferred
+    pub fn drain_deferred(&mut self, backend: &dyn IoBackend) -> Result<()> {
+        while !self.deferred_writes.is_empty() {
+            let byte_length = match self.deferred_writes.front() {
+                Some(w) => w.data.len() as u64,
+                None => break,
+            };
+
+            // Re-check token budget: stop if still exhausted.
+            if let Some(ref budget) = self.duplex_budget {
+                if budget.take_write(byte_length).is_err() {
+                    break;
+                }
+            }
+
+            let write = match self.deferred_writes.pop_front() {
+                Some(w) => w,
+                None => break,
+            };
+
+            // Respect in-flight cap even for deferred writes.
+            self.wait_for_inflight_slot(backend)?;
+
+            // Re-pin the bytes so WriteBudgetManager can inspect the buffer.
+            let mut pinned =
+                PinnedBuffer::alloc(write.data.len()).map_err(FlowCastError::RamFlow)?;
+            pinned.as_mut_slice().copy_from_slice(&write.data);
+
+            self.budget.enqueue_write(write.layer_idx, &pinned).map_err(|e| {
+                FlowCastError::BackendIo(format!(
+                    "write budget deferred layer {}: {e}",
+                    write.layer_idx
+                ))
+            })?;
+
+            if let Some(ref telemetry) = self.telemetry {
+                telemetry.record_write_submitted();
+            }
+            let token = write_token(write.layer_idx);
+            self.inflight.fetch_add(1, Ordering::AcqRel);
+            if let Err(error) =
+                backend.write_async(write.layer_idx, write.byte_offset, byte_length, &pinned, token)
+            {
+                self.inflight.fetch_sub(1, Ordering::AcqRel);
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -279,6 +415,11 @@ impl WritebackScheduler {
     /// Accumulated delta for `layer_idx` (0.0 if not tracked).
     pub fn accumulated_delta(&self, layer_idx: u32) -> f32 {
         self.accumulated_delta.get(&layer_idx).copied().unwrap_or(0.0)
+    }
+
+    /// Number of write-backs currently sitting in the deferred queue.
+    pub fn deferred_count(&self) -> usize {
+        self.deferred_writes.len()
     }
 
     // ------------------------------------------------------------------

@@ -11,6 +11,7 @@ crossbeam-channel = "0.5"
 serde             = { version = "1", features = ["derive"] }
 serde_json        = "1"
 thiserror         = "1"
+libc              = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tempfile   = "3"
@@ -34,6 +35,11 @@ ssd-wear         = ["ramflow/ssd-wear"]
 # All DirectStorage code is #[cfg(target_os = "windows")] so this feature
 # compiles cleanly on Linux (used in CI: --features "mock-cuda,direct-storage").
 direct-storage   = ["ramflow/direct-storage"]
+# Periodic NVMe SMART temperature monitoring and re-profiling (Linux only).
+ssd-thermal      = ["libc"]
+# Two-slot VRAM ping-pong buffer with a dedicated copy stream to overlap
+# RAM→VRAM DMA with GPU compute.  Under mock-cuda the slots are heap buffers.
+cuda-double-buffer = []
 
 [target.'cfg(windows)'.dependencies]
 # Raw Windows API bindings for the DirectStorage COM queue (feature = "direct-storage").

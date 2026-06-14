@@ -1,4 +1,4 @@
-//! A1: Bidirectional prefetch state machine.
+﻿//! A1: Bidirectional prefetch state machine.
 //!
 //! Tracks which pass is active and maintains two direction-keyed maps shared
 //! with the completion-router thread via `Arc<(Mutex<MachineInner>, Condvar)>`:
@@ -6,16 +6,26 @@
 //! * `ready_forward` / `ready_backward`: layer_idx → `PoolSlot` for completed,
 //!   direction-specific reads (API-j fix: separate maps prevent overwrite when
 //!   the same layer_idx appears in both forward and backward windows).
+//!
+//! # DuplexBudget integration (A5-DB)
+//! When a [`DuplexBudget`] is installed via [`PrefetchStateMachine::set_duplex_budget`],
+//! the token bucket is refilled at the top of every [`on_layer_start_with_residency`]
+//! call and read tokens are consumed before each `backend.prefetch` call.  SQEs whose
+//! read-token check fails are pushed to `deferred_reads` and retried at the next
+//! `on_layer_start_with_residency`.
+//!
+//! [`on_layer_start_with_residency`]: PrefetchStateMachine::on_layer_start_with_residency
 
 use crate::backend::{Completion, IoBackend};
 use crate::config::Precision;
 use crate::decode::QuantizedDecoder;
 use crate::ready::ReadyLayer;
+use crate::scheduler::{DuplexBudget, EdfScheduler};
 use crate::{FlowCastError, Result};
 use ramflow::phase::Direction;
 use ramflow::pool::{LayerKind, PoolSlot};
 use ramflow::PoolRegistry;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -102,6 +112,17 @@ impl MachineInner {
 /// (enforced by M1 at shard creation time).
 type ShardIndex = HashMap<u32, (Precision, u64, u64)>;
 
+/// A prefetch SQE deferred because the [`DuplexBudget`] read-token bucket was exhausted.
+///
+/// Stores the layer index, direction, and byte-length so `drain_deferred_reads`
+/// can re-check the token budget without re-reading the shard index.
+struct DeferredRead {
+    layer_idx: u32,
+    direction: Direction,
+    /// Expected transfer byte length (from shard_index, or 0 when unknown).
+    read_len: u64,
+}
+
 /// Bidirectional prefetch state machine (Algorithm A1).
 ///
 /// The `shared` field is an `Arc` cloned into the `CompletionRouter` thread
@@ -125,6 +146,27 @@ pub struct PrefetchStateMachine {
     /// instead of the full pool-slot size (A7-b fix) and tags the resulting
     /// `ReadyLayer` with the per-layer precision (A7-a fix).
     shard_index: RwLock<ShardIndex>,
+    /// EDF scheduler (A5-EDF): reorders SQEs within the A2 window by deadline.
+    ///
+    /// Installed via [`set_edf_scheduler`] after the A3 warm-up profiler runs.
+    /// When `None` (or when the scheduler reports `is_available() == false`),
+    /// `prefetch_targets` falls back to sequential index order.
+    ///
+    /// [`set_edf_scheduler`]: PrefetchStateMachine::set_edf_scheduler
+    edf: RwLock<Option<Arc<EdfScheduler>>>,
+    /// Duplex bandwidth token bucket (A5-DB).
+    ///
+    /// Shared Arc with [`crate::writeback::WritebackScheduler`].  Both sides
+    /// independently call their respective `take_read` / `take_write` buckets.
+    /// The token bucket is refilled once per `on_layer_start_with_residency`
+    /// call (proportional to elapsed wall time) so both sides see fresh tokens
+    /// each training step.
+    budget: RwLock<Option<Arc<DuplexBudget>>>,
+    /// Prefetch SQEs deferred because the read-token bucket was exhausted.
+    ///
+    /// Drained in FIFO order at the top of each `on_layer_start_with_residency`
+    /// after the token bucket has been refilled.
+    deferred_reads: Mutex<VecDeque<DeferredRead>>,
 }
 
 impl PrefetchStateMachine {
@@ -148,6 +190,42 @@ impl PrefetchStateMachine {
             lookahead,
             default_precision,
             shard_index: RwLock::new(HashMap::new()),
+            edf: RwLock::new(None),
+            budget: RwLock::new(None),
+            deferred_reads: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Install an EDF scheduler for deadline-ordered SQE submission (A5-EDF).
+    ///
+    /// Call once after the A3 warm-up profiler completes and returns a
+    /// `HardwareProfile` with a non-empty `layer_plan`. If `scheduler` reports
+    /// [`EdfScheduler::is_available`]`() == false` (empty `layer_plan`), the
+    /// install is a no-op — `prefetch_targets` continues to use sequential order.
+    ///
+    /// Safe to call while the pipeline is running; the swap is protected by the
+    /// internal `RwLock` so in-flight `on_layer_start` calls are not affected.
+    pub fn set_edf_scheduler(&self, scheduler: Arc<EdfScheduler>) {
+        match self.edf.write() {
+            Ok(mut guard) => *guard = Some(scheduler),
+            Err(poison) => *poison.into_inner() = Some(scheduler),
+        }
+    }
+
+    /// Install the duplex bandwidth token bucket (shared with
+    /// [`crate::writeback::WritebackScheduler`]).
+    ///
+    /// Call once during [`crate::FlowCast`] construction, or refresh after
+    /// [`crate::FlowCast::warmup`] updates the measured NVMe bandwidth.
+    ///
+    /// The read-token bucket is consumed before every `backend.prefetch` SQE;
+    /// if exhausted the SQE is pushed to `deferred_reads` and retried at the
+    /// next `on_layer_start_with_residency` call after the bucket has been
+    /// refilled.
+    pub fn set_duplex_budget(&self, budget: Arc<DuplexBudget>) {
+        match self.budget.write() {
+            Ok(mut guard) => *guard = Some(budget),
+            Err(poison) => *poison.into_inner() = Some(budget),
         }
     }
 
@@ -264,6 +342,8 @@ impl PrefetchStateMachine {
                     weight: slot,
                     slab_device_ptrs: Vec::new(),
                     needs_decode: layer_needs_decode,
+                    #[cfg(feature = "cuda-double-buffer")]
+                    copy_event: None,
                 });
             }
 
@@ -339,6 +419,11 @@ impl PrefetchStateMachine {
     /// This is the canonical implementation; [`on_layer_start`] delegates here
     /// with `resident_fn = |_| false` (A1-c2 fix).
     ///
+    /// When a [`DuplexBudget`] is installed, this method:
+    /// 1. Refills the token bucket (proportional to elapsed wall time).
+    /// 2. Drains previously deferred read SQEs (FIFO) up to available tokens.
+    /// 3. Submits the current window, deferring any SQEs whose read-token check fails.
+    ///
     /// [`on_layer_start`]: Self::on_layer_start
     pub fn on_layer_start_with_residency(
         &self,
@@ -348,6 +433,18 @@ impl PrefetchStateMachine {
         backend: &dyn IoBackend,
         resident_fn: impl Fn(u32) -> bool,
     ) -> Result<()> {
+        // A5-DB: refill the token bucket for elapsed time since last call.
+        // Must happen before draining deferred reads so fresh tokens are visible.
+        if let Ok(guard) = self.budget.read() {
+            if let Some(ref budget) = *guard {
+                budget.refill();
+            }
+        }
+
+        // A5-DB: drain previously deferred SQEs in FIFO order before the current
+        // window so older layers get their reads out first.
+        self.drain_deferred_reads(pool, backend)?;
+
         {
             let (mutex, _) = self.shared.as_ref();
             let mut inner = mutex.lock().map_err(|_| {
@@ -368,8 +465,15 @@ impl PrefetchStateMachine {
         Ok(())
     }
 
+    /// Compute the ordered list of layers to prefetch after `current_layer`.
+    ///
+    /// Returns layers in the window `[current±1, current±W]`, clamped to
+    /// `[0, total_layers)`. When an EDF scheduler is installed and available,
+    /// layers are sorted by ascending deadline (A5-EDF); otherwise the list is
+    /// in sequential index order (scalar window fallback for first run / no
+    /// profiler data).
     fn prefetch_targets(&self, current_layer: u32, direction: Direction) -> Vec<u32> {
-        match direction {
+        let mut targets: Vec<u32> = match direction {
             Direction::Forward => {
                 let start = current_layer.saturating_add(1);
                 let end = current_layer.saturating_add(self.lookahead);
@@ -379,10 +483,124 @@ impl PrefetchStateMachine {
                 let start = current_layer.saturating_sub(self.lookahead);
                 (start..current_layer).rev().collect()
             }
+        };
+
+        // A5-EDF: reorder within the window by deadline.
+        // Falls back to sequential order when EDF is unavailable (no profiler
+        // data on first run, or RwLock poisoned — both treated as no-op).
+        if let Ok(guard) = self.edf.read() {
+            if let Some(ref sched) = *guard {
+                if sched.is_available() {
+                    sched.sort_by_deadline(&mut targets);
+                }
+            }
         }
+
+        targets
+    }
+
+    /// Drain deferred read SQEs from the front of `deferred_reads`.
+    ///
+    /// Stops as soon as the read-token bucket is exhausted or the queue is empty.
+    /// Each dequeued entry is re-submitted via `submit_prefetch_for` (which no
+    /// longer applies a budget check for deferred entries — tokens were already
+    /// checked here before dequeuing).
+    fn drain_deferred_reads(&self, pool: &PoolRegistry, backend: &dyn IoBackend) -> Result<()> {
+        loop {
+            // Peek at the front of the queue to decide whether to proceed.
+            let (layer_idx, direction, read_len) = {
+                let deferred = match self.deferred_reads.lock() {
+                    Ok(guard) => guard,
+                    Err(poison) => poison.into_inner(),
+                };
+                match deferred.front() {
+                    Some(entry) => (entry.layer_idx, entry.direction, entry.read_len),
+                    None => break,
+                }
+            };
+
+            // Check token availability; stop if exhausted.
+            if read_len > 0 {
+                if let Ok(guard) = self.budget.read() {
+                    if let Some(ref budget) = *guard {
+                        if budget.take_read(read_len).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Dequeue now that tokens are confirmed available.
+            {
+                let mut deferred = match self.deferred_reads.lock() {
+                    Ok(guard) => guard,
+                    Err(poison) => poison.into_inner(),
+                };
+                deferred.pop_front();
+            }
+
+            // Submit without an additional budget check (tokens taken above).
+            self.submit_prefetch_for_no_budget(layer_idx, direction, pool, backend)?;
+        }
+        Ok(())
     }
 
     fn submit_prefetch_for(
+        &self,
+        target_layer: u32,
+        direction: Direction,
+        pool: &PoolRegistry,
+        backend: &dyn IoBackend,
+    ) -> Result<()> {
+        // Check the shard index for the compressed byte-length used by the budget check.
+        // byte_offset is intentionally not read here — submit_prefetch_for_no_budget
+        // re-reads the shard index under the pool-slot lock for the actual I/O call.
+        let read_len = {
+            let index = self.shard_index.read().map_err(|_| {
+                FlowCastError::BackendIo("shard_index rwlock poisoned".to_string())
+            })?;
+            index
+                .get(&target_layer)
+                .map(|(_, _, byte_len)| *byte_len)
+                .unwrap_or(0u64)
+        };
+
+        // A5-DB: check read-token budget before claiming a pool slot.
+        // Defer rather than block when tokens are exhausted — the SQE will be
+        // retried at the next on_layer_start_with_residency after a refill.
+        if read_len > 0 {
+            if let Ok(guard) = self.budget.read() {
+                if let Some(ref budget) = *guard {
+                    if budget.take_read(read_len).is_err() {
+                        // Push to deferred queue if not already tracked.
+                        let mut deferred = match self.deferred_reads.lock() {
+                            Ok(guard) => guard,
+                            Err(poison) => poison.into_inner(),
+                        };
+                        let already_deferred =
+                            deferred.iter().any(|entry| entry.layer_idx == target_layer);
+                        if !already_deferred {
+                            deferred.push_back(DeferredRead {
+                                layer_idx: target_layer,
+                                direction,
+                                read_len,
+                            });
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        self.submit_prefetch_for_no_budget(target_layer, direction, pool, backend)
+    }
+
+    /// Submit a prefetch SQE without checking the DuplexBudget.
+    ///
+    /// Called from `drain_deferred_reads` (tokens were already consumed before
+    /// dequeuing) and from the degenerate path where `read_len == 0` (no shard
+    /// index entry; we can't budget-check an unknown size).
+    fn submit_prefetch_for_no_budget(
         &self,
         target_layer: u32,
         direction: Direction,
@@ -441,7 +659,7 @@ impl PrefetchStateMachine {
         //
         // FileReadBackend completes synchronously: it reads the file and pushes
         // the completion into its pending queue inside prefetch(). The
-        // CompletionRouter drains that queue every ~50 µs on a background
+        // CompletionRouter drains that queue every ~50 us on a background
         // thread. If prefetch() were called first and in_flight.insert came
         // second, the router could drain the completion, fail to find the token
         // in in_flight, and silently discard it — leaving the layer stuck

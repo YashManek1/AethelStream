@@ -214,4 +214,24 @@ impl AdaptiveWindow {
     pub fn pressure_cap_active(&self) -> bool {
         self.atoms.pressure_cap_active.load(Ordering::Acquire)
     }
+
+    /// Update the W_max ceiling from a background re-profiling result (A3-T, thermal monitor).
+    ///
+    /// If the new ceiling is below the current window, the window is immediately clamped
+    /// to prevent RAM over-allocation (throttling response — shrink now).  If the ceiling
+    /// grew, the A2 EWMA grows the window naturally on the next `update()` call — no
+    /// instant jump avoids RAM pressure spikes.
+    ///
+    /// Takes `&self` so callers holding `&FlowCast` can invoke this from `on_layer_start`
+    /// without requiring `&mut FlowCast`.
+    pub fn apply_w_max_update(&self, new_w_max: u32) {
+        let new_ceiling = (new_w_max as f32).max(1.0);
+        // Release ordering so the next update() call sees the new ceiling.
+        self.atoms.w_max_bits.store(new_ceiling.to_bits(), Ordering::Release);
+        let current = self.atoms.t_iter();
+        if current > new_ceiling {
+            // Immediate shrink: SSD is throttling — reduce lookahead to avoid RAM waste.
+            self.atoms.set_t_iter(new_ceiling);
+        }
+    }
 }

@@ -66,6 +66,19 @@ pub enum RamFlowError {
         /// xxHash3-64 digest computed from received bytes.
         got: u64,
     },
+
+    /// A hardware I/O error (EIO, ENODEV) that persisted after all CQE retries.
+    ///
+    /// Distinct from [`ShardCorrupted`]: checksums detect silent bit-flips in
+    /// successfully transferred data; `MediaError` detects OS-level I/O failures
+    /// reported by the NVMe driver before any bytes are transferred.
+    #[error("media error on shard {shard_id}: errno {errno}")]
+    MediaError {
+        /// Shard file index that produced the hardware error.
+        shard_id: u32,
+        /// Positive errno value extracted from the CQE result (`|cqe.result|`).
+        errno: i32,
+    },
 }
 
 /// Crate-wide `Result` alias.  Every public API that can fail returns this.

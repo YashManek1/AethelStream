@@ -31,6 +31,43 @@ pub mod passthrough;
 #[cfg(feature = "direct-storage")]
 pub mod direct_storage;
 
+/// Classification of a negative CQE result code from io_uring.
+///
+/// The completion router uses this to decide whether to retry the I/O request
+/// (transient kernel contention) or surface an immediate error (hardware failure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CqeErrorKind {
+    /// Transient resource contention — retry is safe.
+    ///
+    /// Errnos: EINTR (4), EAGAIN (11), EBUSY (16).
+    Transient,
+    /// Hardware I/O failure — retrying is unlikely to succeed.
+    ///
+    /// Errnos: EIO (5), ENODEV (19).
+    MediaError,
+    /// Unrecognised errno — treated as non-retriable by default.
+    Unknown(i32),
+}
+
+/// Classify a raw negative CQE result into a [`CqeErrorKind`].
+///
+/// `res` is the raw CQE result (always negative, e.g. `-5` for EIO).
+/// The match is on the positive errno value (`-res`).
+///
+/// # Example
+/// ```
+/// use ramflow::nvme::{classify_cqe_error, CqeErrorKind};
+/// assert_eq!(classify_cqe_error(-11), CqeErrorKind::Transient);  // EAGAIN
+/// assert_eq!(classify_cqe_error(-5),  CqeErrorKind::MediaError); // EIO
+/// ```
+pub fn classify_cqe_error(res: i32) -> CqeErrorKind {
+    match -res {
+        4 | 11 | 16 => CqeErrorKind::Transient,   // EINTR, EAGAIN, EBUSY
+        5 | 19 => CqeErrorKind::MediaError,        // EIO, ENODEV
+        n => CqeErrorKind::Unknown(n),
+    }
+}
+
 pub use engine::DirectNvmeEngine;
 
 mod engine {

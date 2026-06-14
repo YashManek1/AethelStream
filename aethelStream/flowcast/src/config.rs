@@ -102,6 +102,16 @@ pub struct HardwareProfile {
     /// The prefetch engine uses this to size the T_iter lookahead window:
     /// a layer must be fully transferred before its GPU kernel begins.
     pub layer_plan: Vec<LayerTiming>,
+
+    // ---- super-shard section ----
+    /// Optimal super-shard transfer size in bytes, measured by the A3
+    /// latency-vs-size curve probe.
+    ///
+    /// `0` means not yet measured; `SuperShardBackend` falls back to its
+    /// configured `group_size` in that case.  On PCIe 4 NVMe this is
+    /// typically 4–16 MiB.
+    #[serde(default)]
+    pub optimal_super_shard_bytes: u64,
 }
 
 /// Configuration for a FlowCast pipeline instance.
@@ -138,6 +148,39 @@ pub struct FlowCastConfig {
 
     /// Target GPU utilisation fraction (used by A2 to judge under-prefetching).
     pub target_gpu_utilisation: f32,
+
+    /// Steps between periodic SSD temperature checks and re-profiling (`ssd-thermal` feature).
+    ///
+    /// Set to 0 to disable periodic re-profiling. Default: 5 000 steps.
+    #[serde(default = "default_reprofiling_interval_steps")]
+    pub reprofiling_interval_steps: u64,
+
+    /// Maximum times a transient CQE error (EAGAIN, EINTR, EBUSY) is retried
+    /// before escalating to `RamFlowError::MediaError`.
+    ///
+    /// Default: 3. On consumer SSDs under thermal throttling, EAGAIN is common;
+    /// three retries with exponential backoff resolve most transient stalls.
+    #[serde(default = "default_max_cqe_retries")]
+    pub max_cqe_retries: u8,
+
+    /// Base backoff interval for CQE retries in milliseconds.
+    ///
+    /// Retry attempt `n` (1-indexed) waits `2^n × base_backoff_ms` before
+    /// re-submitting the SQE. Default: 5 ms.
+    #[serde(default = "default_base_backoff_ms")]
+    pub base_backoff_ms: u64,
+}
+
+fn default_reprofiling_interval_steps() -> u64 {
+    5_000
+}
+
+fn default_max_cqe_retries() -> u8 {
+    3
+}
+
+fn default_base_backoff_ms() -> u64 {
+    5
 }
 
 impl Default for FlowCastConfig {
@@ -153,6 +196,9 @@ impl Default for FlowCastConfig {
             io_poller_cpu_core: 0,
             completion_router_cpu_core: 1,
             target_gpu_utilisation: 0.95,
+            reprofiling_interval_steps: 5_000,
+            max_cqe_retries: default_max_cqe_retries(),
+            base_backoff_ms: default_base_backoff_ms(),
         }
     }
 }

@@ -13,6 +13,10 @@ use ramflow::pool::PoolSlot;
 /// * The underlying `PinnedBuffer` remains valid until this value is dropped.
 /// * `precision` matches the mode under which the shard was decoded.
 /// * Dropping returns the pinned buffer to the RamFlow pool ring.
+/// * When `copy_event` is `Some`, M5 **must** call
+///   `cuda_stream_wait_event(compute_stream, copy_event)` before dispatching
+///   the compute kernel.  The event fires when the RAM→VRAM DMA into the VRAM
+///   double-buffer slot completes (`cuda-double-buffer` feature only).
 pub struct ReadyLayer {
     /// Layer index (matches `shard_index.json`).
     pub layer_idx: u32,
@@ -35,6 +39,16 @@ pub struct ReadyLayer {
     ///
     /// `true` for INT4 and INT8 precision layers; `false` for FP16/BF16/FP32.
     pub needs_decode: bool,
+
+    /// CUDA event that fires when the RAM→VRAM copy into the VRAM double-buffer
+    /// slot is complete (`cuda-double-buffer` feature only).
+    ///
+    /// `Some` when [`crate::vram_double_buffer::VramDoubleBuffer::advance`] was
+    /// called for this layer; `None` when the feature is disabled or the buffer
+    /// was bypassed.  M5 must call `cuda_stream_wait_event(compute_stream, event)`
+    /// before dispatching compute on `slab_device_ptrs`.
+    #[cfg(feature = "cuda-double-buffer")]
+    pub copy_event: Option<crate::vram_double_buffer::CudaEvent>,
 }
 
 impl ReadyLayer {

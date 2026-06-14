@@ -12,15 +12,51 @@ use ramflow::PinnedBuffer;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// Compute adaptive group size (layers per SQE) from a byte budget and layer sizes.
+///
+/// Uses the median shard size to convert from bytes to a layer count.  Handles
+/// three edge cases:
+/// * All layers smaller than `optimal_bytes`: group_size = `layer_sizes.len()`.
+/// * `optimal_bytes` smaller than one layer: group_size = 1 (no coalescing).
+/// * `optimal_bytes == 0` or `layer_sizes` empty: returns default of 4.
+pub fn compute_group_size(optimal_bytes: u64, layer_sizes: &[u64]) -> u32 {
+    if layer_sizes.is_empty() || optimal_bytes == 0 {
+        return 4;
+    }
+    let mut sorted = layer_sizes.to_vec();
+    sorted.sort_unstable();
+    let median = sorted[sorted.len() / 2];
+    if median == 0 {
+        return 4;
+    }
+    if median >= optimal_bytes {
+        return 1;
+    }
+    let count = (optimal_bytes / median).min(layer_sizes.len() as u64).max(1);
+    count as u32
+}
+
 /// Super-shard grouping configuration.
 pub struct SuperShardConfig {
-    /// Layers coalesced per SQE (4–8).
+    /// Fallback layer-count group size used when `optimal_super_shard_bytes == 0`.
     pub group_size: u32,
+    /// Byte budget measured by the A3 latency-vs-size curve probe.
+    ///
+    /// When non-zero, `SuperShardBackend` flushes a group whenever the
+    /// cumulative pending bytes reach this threshold instead of using a
+    /// fixed layer count.  Handles mixed INT4/FP16 shards correctly.
+    pub optimal_super_shard_bytes: u64,
+    /// Per-layer shard sizes (bytes) used to derive the adaptive group count.
+    pub layer_sizes: Vec<u64>,
 }
 
 impl Default for SuperShardConfig {
     fn default() -> Self {
-        Self { group_size: 4 }
+        Self {
+            group_size: 4,
+            optimal_super_shard_bytes: 0,
+            layer_sizes: Vec::new(),
+        }
     }
 }
 
@@ -34,17 +70,26 @@ struct PendingPrefetch {
 
 /// Super-shard backend wrapping any base `IoBackend`.
 ///
-/// Accumulates up to `group_size` prefetch requests before flushing them as a
-/// group.  Each layer's byte offset within the merged range is tracked in
-/// `layer_offsets` so the completion router can slice correctly.
+/// Group size is determined at warm-up by measuring the io_uring
+/// latency-vs-transfer-size curve and selecting the knee point.  On PCIe 4
+/// NVMe, this is typically 4–16 MiB.  Group size is updated live on thermal
+/// throttling events via [`SuperShardBackend::update_group_size`].
 ///
-/// In the mock/test path the flush submits each pending read individually
-/// (because the base `MockBackend` fills each `dst` buffer independently);
-/// on a real io_uring path a single contiguous SQE covering all `group_size`
-/// layers would be submitted instead.
+/// When `optimal_bytes > 0`, the backend uses a **byte-budget** flush policy:
+/// a group is submitted whenever the cumulative pending bytes reach
+/// `optimal_bytes`.  This handles mixed INT4/FP16 shards correctly without
+/// relying on a fixed layer count.
+///
+/// When `optimal_bytes == 0`, the backend falls back to the count-based policy
+/// (`group_size` layers per SQE).
 pub struct SuperShardBackend {
     base: Box<dyn IoBackend>,
-    group_size: u32,
+    /// Derived adaptive group count (layers per SQE).  Updated atomically by
+    /// [`update_group_size`] without stopping the pipeline.
+    group_size: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Primary byte budget for grouping.  When `> 0`, overrides count-based
+    /// flushing so mixed-size shards are grouped by transfer volume, not count.
+    optimal_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Pending reads waiting to be flushed as a group (A5-e).
     pending: Mutex<Vec<PendingPrefetch>>,
     /// layer_idx → byte offset within the merged SQE range (A5-e).
@@ -52,11 +97,25 @@ pub struct SuperShardBackend {
 }
 
 impl SuperShardBackend {
-    /// Wrap `base` with super-shard grouping.
+    /// Wrap `base` with adaptive super-shard grouping.
+    ///
+    /// If `config.optimal_super_shard_bytes > 0` and `config.layer_sizes` is
+    /// non-empty, the initial group size is derived from the byte budget and
+    /// the median layer size.  Otherwise falls back to `config.group_size`.
     pub fn new(base: Box<dyn IoBackend>, config: SuperShardConfig) -> Self {
+        let initial_group = if config.optimal_super_shard_bytes > 0
+            && !config.layer_sizes.is_empty()
+        {
+            compute_group_size(config.optimal_super_shard_bytes, &config.layer_sizes)
+        } else {
+            config.group_size
+        };
         Self {
             base,
-            group_size: config.group_size,
+            group_size: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(initial_group)),
+            optimal_bytes: std::sync::Arc::new(
+                std::sync::atomic::AtomicU64::new(config.optimal_super_shard_bytes),
+            ),
             pending: Mutex::new(Vec::new()),
             layer_offsets: Mutex::new(HashMap::new()),
         }
@@ -70,6 +129,32 @@ impl SuperShardBackend {
             .unwrap_or_else(|p| p.into_inner())
             .get(&shard_id)
             .copied()
+    }
+
+    /// Current adaptive group size (layers per SQE).
+    ///
+    /// Reflects the last value set by [`update_group_size`].
+    pub fn group_size_hint(&self) -> u32 {
+        self.group_size
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Update the byte budget and derived group count from a re-profiling event.
+    ///
+    /// Called by the thermal monitor (M3-New-3) when SSD throttling shifts the
+    /// latency knee.  Atomically updates both `optimal_bytes` and `group_size`
+    /// without pausing the pipeline.
+    ///
+    /// # Arguments
+    /// * `new_optimal_bytes` — new byte budget from `probe_knee_near` (0 = revert
+    ///   to count-based fallback).
+    /// * `layer_sizes` — current per-layer shard sizes for computing the new count.
+    pub fn update_group_size(&self, new_optimal_bytes: u64, layer_sizes: &[u64]) {
+        use std::sync::atomic::Ordering;
+        self.optimal_bytes
+            .store(new_optimal_bytes, Ordering::Relaxed);
+        let new_count = compute_group_size(new_optimal_bytes, layer_sizes);
+        self.group_size.store(new_count, Ordering::Relaxed);
     }
 
     /// Flush all pending prefetch requests to the base backend.
@@ -101,7 +186,8 @@ impl SuperShardBackend {
             // ignores the destination pointer.  Allocate a minimal placeholder.
             let dst = ramflow::PinnedBuffer::alloc(read.length as usize)
                 .map_err(crate::FlowCastError::RamFlow)?;
-            self.base.prefetch(read.shard_id, read.byte_offset, read.length, &dst, read.token)?;
+            self.base
+                .prefetch(read.shard_id, read.byte_offset, read.length, &dst, read.token)?;
         }
         Ok(())
     }
@@ -120,13 +206,25 @@ impl IoBackend for SuperShardBackend {
         dst: &PinnedBuffer,
         token: u64,
     ) -> Result<()> {
-        // Accumulate into the pending group; only flush once group_size is reached.
+        use std::sync::atomic::Ordering;
+        // Accumulate into the pending group; flush when the byte-budget (or
+        // count-based fallback) threshold is reached.
         // Items must NOT be forwarded to the base backend here — flush_group()
         // handles submission for the whole group atomically.
         let should_flush = {
             let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
             pending.push(PendingPrefetch { shard_id, byte_offset, length, token });
-            pending.len() >= self.group_size as usize
+
+            let optimal = self.optimal_bytes.load(Ordering::Relaxed);
+            if optimal > 0 {
+                // Byte-budget policy: handles mixed INT4/FP16 shards by grouping
+                // consecutive layers until cumulative bytes reach `optimal_bytes`.
+                let cumulative: u64 = pending.iter().map(|r| r.length).sum();
+                cumulative >= optimal
+            } else {
+                // Count-based fallback when no curve measurement is available.
+                pending.len() >= self.group_size.load(Ordering::Relaxed) as usize
+            }
         };
 
         if should_flush {

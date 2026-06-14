@@ -110,6 +110,7 @@ pub use pool::PoolRegistry;
 /// Zero-syscall NVMe engine built on io_uring.
 /// Integrates with the co-scheduler via `pause_signal`.
 pub use nvme::DirectNvmeEngine;
+pub use nvme::{CqeErrorKind, classify_cqe_error};
 
 /// Real-time memory-pressure sensor.  Drives the co-scheduler's prefetch
 /// window adjustments and triggers the slow-path stall handler.

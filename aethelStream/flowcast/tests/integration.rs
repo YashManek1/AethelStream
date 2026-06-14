@@ -62,6 +62,7 @@ fn test_all_public_types_accessible() {
             transfer_ms: 1.2,
             ..Default::default()
         }],
+        optimal_super_shard_bytes: 0,
     };
     assert_eq!(profile.layer_plan.len(), 1);
     let miss = FlowCastError::PrefetchMiss { layer_idx: 7 };
