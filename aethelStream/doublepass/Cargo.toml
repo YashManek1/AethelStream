@@ -1,0 +1,78 @@
+[package]
+name        = "doublepass"
+version     = "0.1.0"
+edition     = "2021"
+description = "AethelStream Module 5 — Double-Pass Backward Engine"
+build       = "build.rs"
+
+[dependencies]
+flowcast  = { path = "../flowcast", default-features = false }
+ramflow   = { path = "../ramflow", default-features = false }
+serde     = { version = "1", features = ["derive"] }
+thiserror = "1"
+
+[features]
+default            = []
+mock-cuda          = ["flowcast/mock-cuda", "ramflow/mock-cuda"]
+fp16-fallback      = []
+ham-offload        = []
+cuda               = ["flowcast/cuda", "ramflow/cuda"]
+cuda-double-buffer = ["flowcast/cuda-double-buffer"]
+
+[dev-dependencies]
+serde_json = "1"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[[test]]
+name = "test_parity_single_layer"
+path = "tests/test_parity_single_layer.rs"
+[[test]]
+name = "test_activation_fidelity"
+path = "tests/test_activation_fidelity.rs"
+
+[[test]]
+name = "test_rng_determinism"
+path = "tests/test_rng_determinism.rs"
+
+[[test]]
+name = "test_amortization"
+path = "tests/test_amortization.rs"
+
+[[test]]
+name = "test_checkpoint_compress"
+path = "tests/test_checkpoint_compress.rs"
+
+[[test]]
+name = "test_segment_recompute"
+path = "tests/test_segment_recompute.rs"
+
+[[test]]
+name = "test_pipeline_idle"
+path = "tests/test_pipeline_idle.rs"
+
+[[test]]
+name = "test_global_clip"
+path = "tests/test_global_clip.rs"
+
+[[test]]
+name = "test_cut_ce"
+path = "tests/test_cut_ce.rs"
+
+[[test]]
+name = "test_precision_paths"
+path = "tests/test_precision_paths.rs"
+
+[[test]]
+name = "test_stochastic_rounding"
+path = "tests/test_stochastic_rounding.rs"
+
+[[test]]
+name = "test_parity_guard"
+path = "tests/test_parity_guard.rs"
+
+[[test]]
+name = "test_ham_equivalence"
+path = "tests/test_ham_equivalence.rs"
