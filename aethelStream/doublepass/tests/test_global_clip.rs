@@ -62,7 +62,11 @@ impl MockOptimizer {
     ) {
         self.params.insert(
             (layer_idx, param_name.to_string()),
-            ParamConfig { sq_norm, kind, true_frob_sq },
+            ParamConfig {
+                sq_norm,
+                kind,
+                true_frob_sq,
+            },
         );
     }
 
@@ -88,10 +92,11 @@ impl OptimizerBackend for MockOptimizer {
     }
 
     fn apply_update(&self, layer_idx: u32, param_name: &str, clip_scale: f32) {
-        self.apply_calls
-            .lock()
-            .expect("lock")
-            .push((layer_idx, param_name.to_string(), clip_scale));
+        self.apply_calls.lock().expect("lock").push((
+            layer_idx,
+            param_name.to_string(),
+            clip_scale,
+        ));
     }
 
     fn zero_accum(&self, layer_idx: u32, param_name: &str) {
@@ -122,7 +127,10 @@ impl OptimizerBackend for MockOptimizer {
 // ---------------------------------------------------------------------------
 
 fn plan_with_max_norm(max_norm: f32) -> TrainingPlan {
-    TrainingPlan { max_grad_norm: max_norm, ..TrainingPlan::default() }
+    TrainingPlan {
+        max_grad_norm: max_norm,
+        ..TrainingPlan::default()
+    }
 }
 
 /// Reproduce the clip coefficient formula from `global_clip` for reference comparisons.
@@ -158,24 +166,22 @@ fn matvec(p_rows: &[Vec<f64>], v: &[f64]) -> Vec<f64> {
 #[cfg(feature = "mock-cuda")]
 fn test_clip_orthonormal_triggers() {
     let mut mock = MockOptimizer::new();
-    let layers: Vec<(u32, String)> = [
-        (0u32, "wq"), (0, "wk"), (1, "wq"), (1, "wk"),
-    ]
-    .iter()
-    .map(|(li, pn)| (*li, pn.to_string()))
-    .collect();
+    let layers: Vec<(u32, String)> = [(0u32, "wq"), (0, "wk"), (1, "wq"), (1, "wk")]
+        .iter()
+        .map(|(li, pn)| (*li, pn.to_string()))
+        .collect();
 
     for (li, pn) in &layers {
         mock.add(*li, pn, 1.0, ProjectorKind::Orthonormal, None);
     }
 
     let plan = plan_with_max_norm(1.0);
-    let result: ClipResult = deferred_apply_with_clip(&mock, &plan, &layers)
-        .expect("deferred_apply_with_clip");
+    let result: ClipResult =
+        deferred_apply_with_clip(&mock, &plan, &layers).expect("deferred_apply_with_clip");
 
-    let total_sq  = 4.0_f64;
-    let exp_gnorm = total_sq.sqrt();          // 2.0
-    let exp_clip  = ref_clip_coeff(total_sq, 1.0);
+    let total_sq = 4.0_f64;
+    let exp_gnorm = total_sq.sqrt(); // 2.0
+    let exp_clip = ref_clip_coeff(total_sq, 1.0);
 
     println!(
         "\nT-CLIP-1a: gnorm={:.6}  clip={:.6}  clipped={}",
@@ -184,13 +190,17 @@ fn test_clip_orthonormal_triggers() {
 
     assert!(
         (result.global_grad_norm - exp_gnorm).abs() < 1e-9,
-        "gnorm: got {:.9} expected {:.9}", result.global_grad_norm, exp_gnorm
+        "gnorm: got {:.9} expected {:.9}",
+        result.global_grad_norm,
+        exp_gnorm
     );
     assert!(
         (result.clip_coeff - exp_clip).abs() < 1e-5,
-        "clip_coeff: got {:.7} expected {:.7}", result.clip_coeff, exp_clip
+        "clip_coeff: got {:.7} expected {:.7}",
+        result.clip_coeff,
+        exp_clip
     );
-    assert!(result.clipped,              "expected clipping to trigger");
+    assert!(result.clipped, "expected clipping to trigger");
     assert!(!result.used_grouped_fallback);
     assert_eq!(result.frobenius_exact_layers, 0);
 
@@ -220,9 +230,7 @@ fn test_clip_orthonormal_triggers() {
 #[cfg(feature = "mock-cuda")]
 fn test_clip_orthonormal_no_clip() {
     let mut mock = MockOptimizer::new();
-    let layers: Vec<(u32, String)> = vec![
-        (0u32, "wq".to_string()), (1u32, "wq".to_string()),
-    ];
+    let layers: Vec<(u32, String)> = vec![(0u32, "wq".to_string()), (1u32, "wq".to_string())];
     for (li, pn) in &layers {
         mock.add(*li, pn, 0.04, ProjectorKind::Orthonormal, None);
     }
@@ -235,17 +243,24 @@ fn test_clip_orthonormal_no_clip() {
         result.global_grad_norm, result.clip_coeff, result.clipped
     );
 
-    assert!(!result.clipped, "clip must not trigger when gnorm < max_norm");
+    assert!(
+        !result.clipped,
+        "clip must not trigger when gnorm < max_norm"
+    );
     assert!(
         (result.clip_coeff - 1.0_f32).abs() < 1e-6,
-        "clip_coeff must be 1.0 when unclipped, got {}", result.clip_coeff
+        "clip_coeff must be 1.0 when unclipped, got {}",
+        result.clip_coeff
     );
     assert!(!result.used_grouped_fallback);
 
     let apply = mock.apply_calls_sorted();
     assert_eq!(apply.len(), 2);
     for (_, pn, scale) in &apply {
-        assert!((scale - 1.0_f32).abs() < 1e-5, "param={pn}: scale={scale:.7} (expected 1.0)");
+        assert!(
+            (scale - 1.0_f32).abs() < 1e-5,
+            "param={pn}: scale={scale:.7} (expected 1.0)"
+        );
     }
     assert_eq!(mock.zero_count(), 2);
 
@@ -271,17 +286,16 @@ fn test_clip_orthonormal_no_clip() {
 fn test_frobenius_norm_preserved_orthonormal() {
     // 2×2 orthogonal rotation matrix (Pythagorean triple 3-4-5 → cos=3/5, sin=4/5).
     // P = [[0.6, -0.8], [0.8, 0.6]].  P^T P = I_2. ✓
-    let p2x2: Vec<Vec<f64>> = vec![
-        vec![ 0.6, -0.8],
-        vec![ 0.8,  0.6],
-    ];
-    let a = vec![3.0_f64, 4.0_f64];   // ‖a‖ = 5.0 exactly
-    let norm_a  = frob(&a);
+    let p2x2: Vec<Vec<f64>> = vec![vec![0.6, -0.8], vec![0.8, 0.6]];
+    let a = vec![3.0_f64, 4.0_f64]; // ‖a‖ = 5.0 exactly
+    let norm_a = frob(&a);
     let norm_pa = frob(&matvec(&p2x2, &a));
 
     println!(
         "\nT-CLIP-FROB (2×2): ‖a‖={:.12}  ‖Pa‖={:.12}  |diff|={:.2e}",
-        norm_a, norm_pa, (norm_pa - norm_a).abs()
+        norm_a,
+        norm_pa,
+        (norm_pa - norm_a).abs()
     );
     assert!(
         (norm_pa - norm_a).abs() < 1e-10,
@@ -292,17 +306,14 @@ fn test_frobenius_norm_preserved_orthonormal() {
     // 4×2 semi-orthogonal (tall-thin, as in GaLore): P^T P = I_2, P P^T ≠ I_4.
     // Columns: [1/√2, 1/√2, 0, 0] and [0, 0, 1/√2, 1/√2].
     let s = 2.0_f64.sqrt().recip();
-    let p4x2: Vec<Vec<f64>> = vec![
-        vec![s, 0.0],
-        vec![s, 0.0],
-        vec![0.0, s],
-        vec![0.0, s],
-    ];
+    let p4x2: Vec<Vec<f64>> = vec![vec![s, 0.0], vec![s, 0.0], vec![0.0, s], vec![0.0, s]];
     let norm_pa4 = frob(&matvec(&p4x2, &a));
 
     println!(
         "T-CLIP-FROB (4×2): ‖a‖={:.12}  ‖Pa‖={:.12}  |diff|={:.2e}",
-        norm_a, norm_pa4, (norm_pa4 - norm_a).abs()
+        norm_a,
+        norm_pa4,
+        (norm_pa4 - norm_a).abs()
     );
     assert!(
         (norm_pa4 - norm_a).abs() < 1e-10,
@@ -332,13 +343,15 @@ fn test_frobenius_norm_preserved_orthonormal() {
 #[test]
 #[cfg(feature = "mock-cuda")]
 fn test_random_projector_jl_approximate() {
-    let true_sq_per   = 100.0_f64;
-    let approx_sq_per =  64.0_f64;
+    let true_sq_per = 100.0_f64;
+    let approx_sq_per = 64.0_f64;
 
     let mut mock = MockOptimizer::new();
     let layers: Vec<(u32, String)> = vec![
-        (0u32, "wq".to_string()), (0, "wk".to_string()),
-        (1u32, "wq".to_string()), (1, "wk".to_string()),
+        (0u32, "wq".to_string()),
+        (0, "wk".to_string()),
+        (1u32, "wq".to_string()),
+        (1, "wk".to_string()),
     ];
     for (li, pn) in &layers {
         mock.add(*li, pn, approx_sq_per, ProjectorKind::Random, None);
@@ -347,30 +360,37 @@ fn test_random_projector_jl_approximate() {
     let plan = plan_with_max_norm(10.0);
     let result = deferred_apply_with_clip(&mock, &plan, &layers).expect("ok");
 
-    let n          = layers.len() as f64;
-    let approx_gsq = approx_sq_per * n;  // 256.0
-    let true_gsq   = true_sq_per   * n;  // 400.0
+    let n = layers.len() as f64;
+    let approx_gsq = approx_sq_per * n; // 256.0
+    let true_gsq = true_sq_per * n; // 400.0
     let exp_approx = ref_clip_coeff(approx_gsq, 10.0);
-    let exp_exact  = ref_clip_coeff(true_gsq,   10.0);
-    let jl_rel     = ((approx_gsq - true_gsq) / true_gsq).abs();  // 0.36
+    let exp_exact = ref_clip_coeff(true_gsq, 10.0);
+    let jl_rel = ((approx_gsq - true_gsq) / true_gsq).abs(); // 0.36
 
     println!(
         "\nT-CLIP-JL-APPROX: approx_gnorm={:.4}  exact_gnorm={:.4}  \
          approx_clip={:.5}  exact_clip={:.5}  jl_rel={:.3}",
-        approx_gsq.sqrt(), true_gsq.sqrt(), exp_approx, exp_exact, jl_rel
+        approx_gsq.sqrt(),
+        true_gsq.sqrt(),
+        exp_approx,
+        exp_exact,
+        jl_rel
     );
 
     // A6 must use the JL-approximate norm.
     assert!(
         (result.clip_coeff - exp_approx).abs() < 1e-5,
-        "JL clip_coeff: got {:.7} expected {:.7}", result.clip_coeff, exp_approx
+        "JL clip_coeff: got {:.7} expected {:.7}",
+        result.clip_coeff,
+        exp_approx
     );
 
     // The approximation must introduce a measurable difference from the exact reference.
     assert!(
         (result.clip_coeff - exp_exact).abs() > 1e-4,
         "JL approx and exact clips are indistinguishable (both {:.7}); \
-         test is not exercising the JL path correctly", result.clip_coeff
+         test is not exercising the JL path correctly",
+        result.clip_coeff
     );
 
     // JL relative error is within a generous bound for this deterministic setup.
@@ -387,7 +407,8 @@ fn test_random_projector_jl_approximate() {
 
     println!(
         "T-CLIP-JL-APPROX PASSED — JL err={jl_rel:.3}, \
-         Δclip={:.5} (approx ≠ exact)", (result.clip_coeff - exp_exact).abs()
+         Δclip={:.5} (approx ≠ exact)",
+        (result.clip_coeff - exp_exact).abs()
     );
 }
 
@@ -408,44 +429,60 @@ fn test_random_projector_jl_approximate() {
 #[test]
 #[cfg(feature = "mock-cuda")]
 fn test_random_projector_frobenius_exact() {
-    let true_sq_per  = 100.0_f64;
-    let approx_sq_per =  64.0_f64;   // what lowrank_grad_sqnorm returns (JL-approx)
+    let true_sq_per = 100.0_f64;
+    let approx_sq_per = 64.0_f64; // what lowrank_grad_sqnorm returns (JL-approx)
     let n = 4_usize;
 
     let mut mock = MockOptimizer::new();
     let layers: Vec<(u32, String)> = vec![
-        (0u32, "wq".to_string()), (0, "wk".to_string()),
-        (1u32, "wq".to_string()), (1, "wk".to_string()),
+        (0u32, "wq".to_string()),
+        (0, "wk".to_string()),
+        (1u32, "wq".to_string()),
+        (1, "wk".to_string()),
     ];
     for (li, pn) in &layers {
-        mock.add(*li, pn, approx_sq_per, ProjectorKind::Random, Some(true_sq_per));
+        mock.add(
+            *li,
+            pn,
+            approx_sq_per,
+            ProjectorKind::Random,
+            Some(true_sq_per),
+        );
     }
 
     let plan = plan_with_max_norm(10.0);
     let result = deferred_apply_with_clip(&mock, &plan, &layers).expect("ok");
 
-    let true_gsq  = true_sq_per * n as f64;  // 400.0
-    let exp_gnorm = true_gsq.sqrt();           // 20.0
-    let exp_clip  = ref_clip_coeff(true_gsq, 10.0);
+    let true_gsq = true_sq_per * n as f64; // 400.0
+    let exp_gnorm = true_gsq.sqrt(); // 20.0
+    let exp_clip = ref_clip_coeff(true_gsq, 10.0);
 
     println!(
         "\nT-CLIP-JL-EXACT: gnorm={:.6}  expected={:.6}  clip={:.6}  exact={:.6}  \
          frob_exact_layers={}",
-        result.global_grad_norm, exp_gnorm, result.clip_coeff,
-        exp_clip, result.frobenius_exact_layers
+        result.global_grad_norm,
+        exp_gnorm,
+        result.clip_coeff,
+        exp_clip,
+        result.frobenius_exact_layers
     );
 
     assert!(
         (result.global_grad_norm - exp_gnorm).abs() < 1e-9,
-        "gnorm: got {:.9} expected {:.9}", result.global_grad_norm, exp_gnorm
+        "gnorm: got {:.9} expected {:.9}",
+        result.global_grad_norm,
+        exp_gnorm
     );
     assert!(
         (result.clip_coeff - exp_clip).abs() < 1e-5,
-        "clip_coeff: got {:.7} expected {:.7}", result.clip_coeff, exp_clip
+        "clip_coeff: got {:.7} expected {:.7}",
+        result.clip_coeff,
+        exp_clip
     );
     assert_eq!(
         result.frobenius_exact_layers, n as u32,
-        "expected frobenius_exact_layers={n}, got {}", result.frobenius_exact_layers
+        "expected frobenius_exact_layers={n}, got {}",
+        result.frobenius_exact_layers
     );
     assert!(!result.used_grouped_fallback);
 
@@ -473,30 +510,35 @@ fn test_random_projector_frobenius_exact() {
 fn test_grouped_fallback_none_projector() {
     let mut mock = MockOptimizer::new();
     let layers: Vec<(u32, String)> = vec![
-        (0u32, "wq".to_string()), (0, "wk".to_string()),
-        (1u32, "wq".to_string()), (1, "wk".to_string()),
+        (0u32, "wq".to_string()),
+        (0, "wk".to_string()),
+        (1u32, "wq".to_string()),
+        (1, "wk".to_string()),
     ];
-    mock.add(0, "wq",  9.0,  ProjectorKind::None, None);
-    mock.add(0, "wk", 16.0,  ProjectorKind::None, None);
-    mock.add(1, "wq",  0.04, ProjectorKind::None, None);
-    mock.add(1, "wk",  0.04, ProjectorKind::None, None);
+    mock.add(0, "wq", 9.0, ProjectorKind::None, None);
+    mock.add(0, "wk", 16.0, ProjectorKind::None, None);
+    mock.add(1, "wq", 0.04, ProjectorKind::None, None);
+    mock.add(1, "wk", 0.04, ProjectorKind::None, None);
 
     let max_norm = 1.0_f64;
     let plan = plan_with_max_norm(max_norm as f32);
     let result = deferred_apply_with_clip(&mock, &plan, &layers).expect("grouped ok");
 
     // Reference per-layer clips (same formula as `grouped_clip_fallback`).
-    let l0_sq    = 9.0_f64 + 16.0;                                            // 25.0
-    let l0_clip  = ((max_norm / (l0_sq.sqrt() + 1e-6)) as f32).min(1.0); // ≈ 0.2
-    let l1_sq    = 0.04_f64 + 0.04;
-    let l1_clip  = ((max_norm / (l1_sq.sqrt() + 1e-6)) as f32).min(1.0); // = 1.0
+    let l0_sq = 9.0_f64 + 16.0; // 25.0
+    let l0_clip = ((max_norm / (l0_sq.sqrt() + 1e-6)) as f32).min(1.0); // ≈ 0.2
+    let l1_sq = 0.04_f64 + 0.04;
+    let l1_clip = ((max_norm / (l1_sq.sqrt() + 1e-6)) as f32).min(1.0); // = 1.0
 
     println!(
         "\nT-CLIP-GROUPED: l0_clip={:.6}  l1_clip={:.6}  used_fallback={}",
         l0_clip, l1_clip, result.used_grouped_fallback
     );
 
-    assert!(result.used_grouped_fallback, "expected grouped fallback to engage");
+    assert!(
+        result.used_grouped_fallback,
+        "expected grouped fallback to engage"
+    );
     assert_eq!(result.frobenius_exact_layers, 0);
 
     let apply = mock.apply_calls_sorted();
@@ -546,13 +588,15 @@ fn test_grouped_fallback_none_projector() {
 fn test_grouped_fallback_not_when_orthonormal() {
     let mut mock = MockOptimizer::new();
     let layers: Vec<(u32, String)> = vec![
-        (0u32, "wq".to_string()), (0, "wk".to_string()),
-        (1u32, "wq".to_string()), (1, "wk".to_string()),
+        (0u32, "wq".to_string()),
+        (0, "wk".to_string()),
+        (1u32, "wq".to_string()),
+        (1, "wk".to_string()),
     ];
-    mock.add(0, "wq",  9.0,  ProjectorKind::Orthonormal, None);
-    mock.add(0, "wk", 16.0,  ProjectorKind::Orthonormal, None);
-    mock.add(1, "wq",  0.04, ProjectorKind::Orthonormal, None);
-    mock.add(1, "wk",  0.04, ProjectorKind::Orthonormal, None);
+    mock.add(0, "wq", 9.0, ProjectorKind::Orthonormal, None);
+    mock.add(0, "wk", 16.0, ProjectorKind::Orthonormal, None);
+    mock.add(1, "wq", 0.04, ProjectorKind::Orthonormal, None);
+    mock.add(1, "wk", 0.04, ProjectorKind::Orthonormal, None);
 
     let plan = plan_with_max_norm(1.0);
     let result = deferred_apply_with_clip(&mock, &plan, &layers).expect("ok");
@@ -568,7 +612,7 @@ fn test_grouped_fallback_not_when_orthonormal() {
     );
 
     // All params must receive the same global clip scale.
-    let global_gsq  = 9.0 + 16.0 + 0.04 + 0.04;
+    let global_gsq = 9.0 + 16.0 + 0.04 + 0.04;
     let global_clip = ref_clip_coeff(global_gsq, 1.0);
     let apply = mock.apply_calls_sorted();
     assert_eq!(apply.len(), 4);
@@ -592,7 +636,9 @@ fn test_empty_trainable_layers_returns_error() {
     struct NullOpt;
     impl OptimizerBackend for NullOpt {
         fn project_and_accumulate(&self, _: &[f32], _: u32, _: &str) {}
-        fn lowrank_grad_sqnorm(&self, _: u32, _: &str) -> f64 { 0.0 }
+        fn lowrank_grad_sqnorm(&self, _: u32, _: &str) -> f64 {
+            0.0
+        }
         fn apply_update(&self, _: u32, _: &str, _: f32) {}
         fn zero_accum(&self, _: u32, _: &str) {}
         fn notify_step(&self, _: u64) {}
@@ -622,42 +668,51 @@ fn test_empty_trainable_layers_returns_error() {
 fn test_random_mixed_exact_and_jl() {
     // wq: clip-critical — has the O(1) Frobenius accumulator.
     // wk: not critical  — JL-approximate norm used.
-    let true_sq_wq   = 100.0_f64;
-    let approx_sq_wq =  81.0_f64;  // JL-approx for wq (ignored — exact path overrides)
-    let approx_sq_wk =  36.0_f64;  // JL-approx for wk (used)
+    let true_sq_wq = 100.0_f64;
+    let approx_sq_wq = 81.0_f64; // JL-approx for wq (ignored — exact path overrides)
+    let approx_sq_wk = 36.0_f64; // JL-approx for wk (used)
 
     let mut mock = MockOptimizer::new();
-    let layers: Vec<(u32, String)> = vec![
-        (0u32, "wq".to_string()),
-        (0u32, "wk".to_string()),
-    ];
-    mock.add(0, "wq", approx_sq_wq, ProjectorKind::Random, Some(true_sq_wq));
+    let layers: Vec<(u32, String)> = vec![(0u32, "wq".to_string()), (0u32, "wk".to_string())];
+    mock.add(
+        0,
+        "wq",
+        approx_sq_wq,
+        ProjectorKind::Random,
+        Some(true_sq_wq),
+    );
     mock.add(0, "wk", approx_sq_wk, ProjectorKind::Random, None);
 
     let plan = plan_with_max_norm(1.0);
     let result = deferred_apply_with_clip(&mock, &plan, &layers).expect("ok");
 
     // Expected: true_sq_wq (exact) + approx_sq_wk (JL).
-    let exp_gsq   = true_sq_wq + approx_sq_wk;  // 136.0
+    let exp_gsq = true_sq_wq + approx_sq_wk; // 136.0
     let exp_gnorm = exp_gsq.sqrt();
-    let exp_clip  = ref_clip_coeff(exp_gsq, 1.0);
+    let exp_clip = ref_clip_coeff(exp_gsq, 1.0);
 
     println!(
         "\nT-CLIP-MIXED: gnorm={:.6}  expected={:.6}  clip={:.6}  \
          frob_exact_layers={}",
-        result.global_grad_norm, exp_gnorm, result.clip_coeff,
-        result.frobenius_exact_layers
+        result.global_grad_norm, exp_gnorm, result.clip_coeff, result.frobenius_exact_layers
     );
 
     assert!(
         (result.global_grad_norm - exp_gnorm).abs() < 1e-9,
-        "gnorm: got {:.9} expected {:.9}", result.global_grad_norm, exp_gnorm
+        "gnorm: got {:.9} expected {:.9}",
+        result.global_grad_norm,
+        exp_gnorm
     );
     assert!(
         (result.clip_coeff - exp_clip).abs() < 1e-5,
-        "clip_coeff: got {:.7} expected {:.7}", result.clip_coeff, exp_clip
+        "clip_coeff: got {:.7} expected {:.7}",
+        result.clip_coeff,
+        exp_clip
     );
-    assert_eq!(result.frobenius_exact_layers, 1, "expected 1 frob-exact layer");
+    assert_eq!(
+        result.frobenius_exact_layers, 1,
+        "expected 1 frob-exact layer"
+    );
     assert!(!result.used_grouped_fallback);
 
     println!("T-CLIP-MIXED PASSED — mixed exact/JL arms, frobenius_exact_layers=1");

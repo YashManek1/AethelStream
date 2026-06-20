@@ -54,3 +54,62 @@ def reference_train(
         optimizer.step()
         losses.append(loss.item())
     return losses
+
+
+def config_125m() -> dict:
+    """Return hyperparameters for the 125M model (scaled for speed with 2 layers)."""
+    return {
+        "vocab_size": 50257,
+        "d_model": 768,
+        "n_heads": 12,
+        "d_ff": 3072,
+        "n_layers": 2,  # Reduced from 12 for speed
+    }
+
+
+if __name__ == "__main__":
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--steps", type=int, default=5, help="Number of training steps")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument(
+        "--output", type=str, default="pyref/reference_losses.json", help="Output JSON path"
+    )
+    args = parser.parse_args()
+
+    cfg = config_125m()
+    vocab_size = cfg["vocab_size"]
+    d_model = cfg["d_model"]
+    n_heads = cfg["n_heads"]
+    d_ff = cfg["d_ff"]
+
+    # Build model with 2 blocks
+    model = TinyLM(vocab_size, d_model, n_heads, d_ff)
+    model.to(torch.device("cpu"))
+
+    # Random data generator
+    def data_generator():
+        while True:
+            yield torch.randint(0, vocab_size, (1, 4))
+
+    gen = data_generator()
+
+    # Train for args.steps
+    losses = reference_train(model, gen, n_steps=args.steps, lr=args.lr)
+
+    # Write to JSON
+    output_data = {
+        "losses": losses,
+        "step_count": args.steps,
+        "config": "125M (2-layer reduction for speed)",
+        "backend": "REFERENCE: PyTorch f32 AdamW, CPU-only",
+    }
+    with open(args.output, "w") as f:
+        json.dump(output_data, f, indent=2)
+
+    print(
+        f"REFERENCE: PyTorch f32 AdamW, CPU-only — {args.steps} steps, "
+        f"losses[0]={losses[0]:.6f}, losses[-1]={losses[-1]:.6f}"
+    )

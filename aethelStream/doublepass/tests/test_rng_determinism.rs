@@ -4,9 +4,9 @@
 //! Run: cargo test --features mock-cuda -p doublepass test_rng_determinism -- --nocapture
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use doublepass::checkpoint::read_checkpoint;
 use doublepass::forward::{full_forward, single_layer_forward, BlockConfig, Model};
 use doublepass::plan::TrainingPlan;
-use doublepass::checkpoint::read_checkpoint;
 use doublepass::rng;
 
 const CFG: BlockConfig = BlockConfig {
@@ -20,11 +20,13 @@ const CFG: BlockConfig = BlockConfig {
 
 fn init_input() -> Vec<f32> {
     let n = CFG.batch * CFG.seq_len * CFG.d_model;
-    (0..n).map(|i| ((i as f64 * 0.11).cos() * 0.4) as f32).collect()
+    (0..n)
+        .map(|i| ((i as f64 * 0.11).cos() * 0.4) as f32)
+        .collect()
 }
 
 /// T-RNG (part a): recompute WITH RNG restore reproduces forward activations exactly.
-/// 
+///
 /// Strategy: store intermediate forward outputs, then check that restore reproduces them.
 #[test]
 #[cfg(feature = "mock-cuda")]
@@ -42,7 +44,7 @@ fn test_rng_restore_exact_reproduction() {
     // The final output is at result.outputs[0].
     // Let's recompute the last layer with RNG restore and check it matches.
     // Layer 2 checkpoint = INPUT to layer 2. We need to capture from layer 1 output first.
-    
+
     // Strategy: recompute layer 1 and layer 2 independently, comparing with full forward.
     // Start with checkpoint at layer 0 (= input to layer 0).
     let ckpt_l0 = result
@@ -80,7 +82,10 @@ fn test_rng_restore_exact_reproduction() {
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
 
-    println!("\nT-RNG (restore): max|recomputed - golden| = {:.3e}  (expected 0)", max_diff);
+    println!(
+        "\nT-RNG (restore): max|recomputed - golden| = {:.3e}  (expected 0)",
+        max_diff
+    );
     assert_eq!(
         recomputed_output, *golden_output,
         "T-RNG FAILED: recompute WITH restore must be bit-identical to golden"
@@ -127,7 +132,10 @@ fn test_rng_no_restore_differs() {
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
 
-    println!("\nT-RNG (no restore): max|recomputed - golden| = {:.3e}  (expected > 0)", max_diff);
+    println!(
+        "\nT-RNG (no restore): max|recomputed - golden| = {:.3e}  (expected > 0)",
+        max_diff
+    );
     assert!(
         max_diff > 0.0,
         "T-RNG negative control FAILED: outputs must differ when RNG is not restored \

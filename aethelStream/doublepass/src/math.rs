@@ -61,11 +61,7 @@ pub(crate) fn rms_norm_fwd(
     let eps = 1e-6f32;
 
     for b in 0..bs {
-        let mean_sq: f32 = x[b * d..(b + 1) * d]
-            .iter()
-            .map(|v| v * v)
-            .sum::<f32>()
-            / d as f32;
+        let mean_sq: f32 = x[b * d..(b + 1) * d].iter().map(|v| v * v).sum::<f32>() / d as f32;
         rms[b] = (mean_sq + eps).sqrt();
 
         for i in 0..d {
@@ -88,10 +84,7 @@ pub(crate) fn softmax_rows(s: &[f32], rows: usize, cols: usize) -> Vec<f32> {
         let row = &s[row_start..row_end];
 
         // Compute max for numerical stability
-        let max_val = row
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
+        let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
 
         // Compute exp and sum
         let mut exps = vec![0.0f32; cols];

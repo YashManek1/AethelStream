@@ -28,7 +28,10 @@ impl LayerSchedule {
     /// Create a layer schedule for `num_layers` transformer layers checkpointed
     /// every `checkpoint_freq` layers.
     pub fn new(num_layers: u32, checkpoint_freq: u32) -> Self {
-        Self { num_layers, checkpoint_freq }
+        Self {
+            num_layers,
+            checkpoint_freq,
+        }
     }
 
     /// Ascending layer indices for the forward pass: `[0, 1, …, num_layers-1]`.

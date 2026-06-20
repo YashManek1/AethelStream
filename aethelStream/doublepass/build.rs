@@ -1,7 +1,7 @@
 #![allow(clippy::panic, clippy::expect_used)]
 
-use std::path::PathBuf;
 use std::env;
+use std::path::PathBuf;
 
 fn main() {
     let is_mock_cuda = cfg!(feature = "mock-cuda");
@@ -37,7 +37,10 @@ fn main() {
 
     // Find nvcc
     let nvcc_exe = find_nvcc().expect("nvcc not found; set NVCC env or CUDA_PATH");
-    println!("cargo:rustc-link-search=native={}", find_cuda_lib_dir().display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        find_cuda_lib_dir().display()
+    );
 
     // Compile each .cu to .o
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
@@ -49,7 +52,8 @@ fn main() {
                 .file_stem()
                 .expect("cu file stem")
                 .to_string_lossy()
-                .to_string() + ".o",
+                .to_string()
+                + ".o",
         );
 
         let status = std::process::Command::new(&nvcc_exe)

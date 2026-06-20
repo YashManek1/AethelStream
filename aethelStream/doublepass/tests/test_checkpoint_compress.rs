@@ -69,6 +69,9 @@ fn test_uncompressed_roundtrip_bit_identical() {
     let buf = store_checkpoint(&data, false).expect("store uncompressed");
     assert!(!buf.is_compressed(), "uncompressed flag must not be set");
     let recovered = read_checkpoint(&buf).expect("read uncompressed");
-    assert_eq!(data, recovered, "uncompressed round-trip must be bit-identical");
+    assert_eq!(
+        data, recovered,
+        "uncompressed round-trip must be bit-identical"
+    );
     println!("Uncompressed round-trip PASSED (bit-identical)");
 }

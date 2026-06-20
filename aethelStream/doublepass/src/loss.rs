@@ -153,9 +153,29 @@ pub fn streaming_cut_ce(
 
     iter_chunks(vocab_size, chunk_size, |v_start, c| {
         let w_chunk = &lm_head[v_start * d_model..(v_start + c) * d_model];
-        compute_chunk_logits(hidden, w_chunk, &mut logit_chunk[..batch_seq * c], batch_seq, d_model, c);
-        online_softmax_update(&mut run_max, &mut run_sumexp, &logit_chunk[..batch_seq * c], batch_seq, c);
-        capture_label_logits(&mut label_logit, &logit_chunk[..batch_seq * c], labels, v_start, batch_seq, c);
+        compute_chunk_logits(
+            hidden,
+            w_chunk,
+            &mut logit_chunk[..batch_seq * c],
+            batch_seq,
+            d_model,
+            c,
+        );
+        online_softmax_update(
+            &mut run_max,
+            &mut run_sumexp,
+            &logit_chunk[..batch_seq * c],
+            batch_seq,
+            c,
+        );
+        capture_label_logits(
+            &mut label_logit,
+            &logit_chunk[..batch_seq * c],
+            labels,
+            v_start,
+            batch_seq,
+            c,
+        );
     });
 
     // --- Scalar loss --------------------------------------------------------
@@ -171,7 +191,14 @@ pub fn streaming_cut_ce(
     iter_chunks(vocab_size, chunk_size, |v_start, c| {
         let w_chunk = &lm_head[v_start * d_model..(v_start + c) * d_model];
         // Recompute this tile's logits — avoids storing O(V) logits between passes.
-        compute_chunk_logits(hidden, w_chunk, &mut logit_chunk[..batch_seq * c], batch_seq, d_model, c);
+        compute_chunk_logits(
+            hidden,
+            w_chunk,
+            &mut logit_chunk[..batch_seq * c],
+            batch_seq,
+            d_model,
+            c,
+        );
         accumulate_grad_hidden(
             &mut grad_hidden,
             &logit_chunk[..batch_seq * c],
@@ -212,7 +239,11 @@ pub fn streaming_cut_ce(
     }
 
     let peak_logit_bytes = batch_seq * actual_chunk * std::mem::size_of::<f32>();
-    Ok(LossOutput { loss, grad_hidden, peak_logit_bytes })
+    Ok(LossOutput {
+        loss,
+        grad_hidden,
+        peak_logit_bytes,
+    })
 }
 
 // ---------------------------------------------------------------------------

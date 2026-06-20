@@ -7,9 +7,9 @@
 //! Run: cargo test --features mock-cuda -p doublepass test_activation_fidelity -- --nocapture
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use doublepass::checkpoint::{read_checkpoint, store_checkpoint};
 use doublepass::forward::{full_forward, BlockConfig, Model};
 use doublepass::plan::TrainingPlan;
-use doublepass::checkpoint::{read_checkpoint, store_checkpoint};
 
 const CFG: BlockConfig = BlockConfig {
     d_model: 8,
@@ -22,11 +22,16 @@ const CFG: BlockConfig = BlockConfig {
 
 fn init_input() -> Vec<f32> {
     let n = CFG.batch * CFG.seq_len * CFG.d_model;
-    (0..n).map(|i| ((i as f64 * 0.07).sin() * 0.3) as f32).collect()
+    (0..n)
+        .map(|i| ((i as f64 * 0.07).sin() * 0.3) as f32)
+        .collect()
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }
 
 /// T-ACT-2: golden full-forward vs. recompute from checkpoint at layer 0.
@@ -59,7 +64,10 @@ fn test_activation_fidelity_t_act2() {
     // Assert the checkpoint lives in a PinnedBuffer (not a plain Vec).
     // This is guaranteed by the type system — PinnedBuffer is the return type.
     assert!(ckpt_buf.len() > 0, "checkpoint buffer must be non-empty");
-    assert!(!ckpt_buf.is_compressed(), "uncompressed path should not set compressed flag");
+    assert!(
+        !ckpt_buf.is_compressed(),
+        "uncompressed path should not set compressed flag"
+    );
 
     // Round-trip: store and read back; must be byte-identical.
     let ckpt_data = read_checkpoint(ckpt_buf).expect("read_checkpoint");
@@ -80,7 +88,10 @@ fn test_activation_fidelity_t_act2() {
     }
 
     let diff = max_abs_diff(&golden.outputs[0], &recomputed);
-    println!("\nT-ACT-2: max|golden - recomputed| = {:.3e}  (tol = 1e-5)", diff);
+    println!(
+        "\nT-ACT-2: max|golden - recomputed| = {:.3e}  (tol = 1e-5)",
+        diff
+    );
     assert!(
         diff < 1e-5,
         "T-ACT-2 FAILED: max|diff| {:.3e} >= 1e-5",

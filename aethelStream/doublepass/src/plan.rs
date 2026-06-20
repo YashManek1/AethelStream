@@ -1,72 +1,225 @@
+#![allow(missing_docs)]
+
 //! Training plan types consumed from M9 (SARP) and user configuration.
 
-/// Action assigned to a checkpoint segment by the M9 SARP planner.
+/// Number of distinct compute stages in one transformer block.
+pub const NUM_OPS: usize = 7;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[repr(usize)]
+/// The seven compute stages of one transformer block, in execution order.
+pub enum OpKind {
+    /// First RMSNorm (pre-attention).
+    Rms1 = 0,
+    /// Q / K / V projection matmuls.
+    QkvProj = 1,
+    /// Attention scores, softmax, and weighted-V aggregation.
+    AttnSoftmax = 2,
+    /// Output projection + dropout.
+    OutProj = 3,
+    /// Second RMSNorm (pre-MLP).
+    Rms2 = 4,
+    /// Gate and Up projections + SiLU activation.
+    MlpGateUp = 5,
+    /// Down projection + residual add.
+    MlpDown = 6,
+}
+
+impl OpKind {
+    pub fn all() -> impl Iterator<Item = OpKind> {
+        [
+            OpKind::Rms1,
+            OpKind::QkvProj,
+            OpKind::AttnSoftmax,
+            OpKind::OutProj,
+            OpKind::Rms2,
+            OpKind::MlpGateUp,
+            OpKind::MlpDown,
+        ]
+        .into_iter()
+    }
+
+    /// Item.
+    pub fn flop_fraction(self) -> f64 {
+        match self {
+            OpKind::Rms1 => 0.02,
+            OpKind::QkvProj => 0.27,
+            OpKind::AttnSoftmax => 0.08,
+            OpKind::OutProj => 0.09,
+            OpKind::Rms2 => 0.02,
+            OpKind::MlpGateUp => 0.27,
+            OpKind::MlpDown => 0.25,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Item.
+pub struct SelectiveRecomputeMask {
+    pub ops: [bool; NUM_OPS],
+}
+
+impl SelectiveRecomputeMask {
+    /// Item.
+    pub fn attn_interior_only() -> Self {
+        let mut ops = [false; NUM_OPS];
+        ops[OpKind::AttnSoftmax as usize] = true;
+        Self { ops }
+    }
+
+    /// Item.
+    pub fn full_recompute() -> Self {
+        Self {
+            ops: [true; NUM_OPS],
+        }
+    }
+
+    /// Item.
+    pub fn retain_all() -> Self {
+        Self {
+            ops: [false; NUM_OPS],
+        }
+    }
+
+    #[inline]
+    /// Item.
+    pub fn should_recompute(&self, op: OpKind) -> bool {
+        self.ops[op as usize]
+    }
+
+    /// Item.
+    pub fn is_full_recompute(&self) -> bool {
+        self.ops.iter().all(|&b| b)
+    }
+
+    /// Item.
+    pub fn recompute_flop_fraction(&self) -> f64 {
+        OpKind::all()
+            .filter(|&op| self.should_recompute(op))
+            .map(OpKind::flop_fraction)
+            .sum()
+    }
+}
+
+impl Default for SelectiveRecomputeMask {
+    fn default() -> Self {
+        Self::full_recompute()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Item.
 pub enum ActivationAction {
-    /// Recompute the segment forward during backward (idle compute is free in I/O-bound regime).
     Recompute,
-    /// Keep the segment activations resident in VRAM from the forward pass.
     RetainVram,
-    /// Fetch activations from the M2 LZ4 compressed-RAM tier (no recompute, no SSD).
     PageCompressedRam,
-    /// Fetch activations via M3 write-back from NVMe tier.
     PageNvme,
 }
 
-/// Per-segment schedule emitted by M9's SARP DP.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Item.
 pub struct SegmentPlan {
-    /// Which checkpoint segment this plan applies to.
     pub segment_index: u32,
-    /// Action to take during backward for this segment.
     pub action: ActivationAction,
-    /// Per-op selective-recompute mask (A2′). `true` = recompute; `false` = retain.
-    /// Indexed by op position within the segment (attention interior = true by default).
     pub recompute_ops: Vec<bool>,
 }
 
-/// Training mode / tier (read from M9 TrainingPlan.tier).
+impl SegmentPlan {
+    /// Item.
+    pub fn with_full_recompute(segment_index: u32) -> Self {
+        Self {
+            segment_index,
+            action: ActivationAction::Recompute,
+            recompute_ops: vec![true; NUM_OPS],
+        }
+    }
+
+    /// Item.
+    pub fn with_selective_recompute(segment_index: u32) -> Self {
+        let mask = SelectiveRecomputeMask::attn_interior_only();
+        Self {
+            segment_index,
+            action: ActivationAction::Recompute,
+            recompute_ops: mask.ops.to_vec(),
+        }
+    }
+
+    /// Item.
+    pub fn retain_vram(segment_index: u32) -> Self {
+        Self {
+            segment_index,
+            action: ActivationAction::RetainVram,
+            recompute_ops: vec![false; NUM_OPS],
+        }
+    }
+
+    /// Item.
+    pub fn page_compressed_ram(segment_index: u32) -> Self {
+        Self {
+            segment_index,
+            action: ActivationAction::PageCompressedRam,
+            recompute_ops: vec![false; NUM_OPS],
+        }
+    }
+
+    /// Item.
+    pub fn page_nvme(segment_index: u32) -> Self {
+        Self {
+            segment_index,
+            action: ActivationAction::PageNvme,
+            recompute_ops: vec![false; NUM_OPS],
+        }
+    }
+
+    /// Item.
+    pub fn selective_mask(&self) -> SelectiveRecomputeMask {
+        let mut mask = SelectiveRecomputeMask::full_recompute();
+        for (index, &flag) in self.recompute_ops.iter().enumerate() {
+            if index < NUM_OPS {
+                mask.ops[index] = flag;
+            }
+        }
+        mask
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Item.
 pub enum TrainingTier {
-    /// All layers trainable; full GaLore low-rank states; full-param write-back.
     FullGaLore,
-    /// Base weights frozen (read-only stream, no write-back); only LoRA A/B trainable.
     LoraOnly,
-    /// Freeze all but the K most-sensitive layers; frozen layers skip the hook entirely.
     TopKFreeze(u32),
-    /// INT4 weights everywhere; checkpoint compression forced.
     Int4Everywhere,
 }
 
-/// Read-only view of the M9 TrainingPlan fields consumed by M5.
-///
-/// In production this will be deserialized from the M9 ElasticScale output.
-/// For the S0 scaffold it is constructed directly in tests.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Item.
 pub struct TrainingPlan {
-    /// Checkpoint frequency `k`: one sparse checkpoint every `k` layers.
     pub checkpoint_freq: u32,
-    /// Micro-batch token count `s` (tokens per micro-batch per gradient-accumulation step).
     pub micro_batch: u32,
-    /// Gradient-accumulation depth `G`.
     pub grad_accum: u32,
-    /// Per-layer precision schedule (index = layer_idx). Uses flowcast::Precision.
     pub precision_schedule: Vec<crate::Precision>,
-    /// Low-rank dimension for GaLore projection.
     pub optimizer_rank: u32,
-    /// Training mode.
     pub tier: TrainingTier,
-    /// Prefetch window hint `W` (number of layers to keep in-flight simultaneously).
     pub w_max_hint: u32,
-    /// Per-segment activation materialization schedule from the M9 SARP DP.
-    /// Empty when M9 has not yet run; M5 falls back to the A2/A9 heuristic.
     pub activation_schedule: Vec<SegmentPlan>,
-    /// Interval between parity diagnostic checks (A7). 0 = disabled.
     pub parity_check_interval: u64,
-    /// Interval between M4 projection refreshes (forwarded to optimizer; M5 does not own this).
     pub projection_refresh_interval: u64,
-    /// Maximum gradient norm for global clipping (A6).
     pub max_grad_norm: f32,
+}
+
+impl TrainingPlan {
+    /// Item.
+    pub fn has_sarp_schedule(&self) -> bool {
+        !self.activation_schedule.is_empty()
+    }
+
+    /// Item.
+    pub fn segment_plan(&self, segment_index: u32) -> Option<&SegmentPlan> {
+        self.activation_schedule
+            .iter()
+            .find(|sp| sp.segment_index == segment_index)
+    }
 }
 
 impl Default for TrainingPlan {
@@ -87,13 +240,10 @@ impl Default for TrainingPlan {
     }
 }
 
-/// A partial plan update (e.g., window-size or precision change from M9 mid-run).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Item.
 pub struct PlanDelta {
-    /// Override the prefetch window hint.
     pub w_max_hint: Option<u32>,
-    /// Override the checkpoint frequency.
     pub checkpoint_freq: Option<u32>,
-    /// Override per-layer precision (only layers listed here are changed).
     pub precision_overrides: Vec<(u32, crate::Precision)>,
 }

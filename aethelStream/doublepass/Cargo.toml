@@ -6,6 +6,8 @@ description = "AethelStream Module 5 — Double-Pass Backward Engine"
 build       = "build.rs"
 
 [dependencies]
+serde_json = "1"
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
 flowcast  = { path = "../flowcast", default-features = false }
 ramflow   = { path = "../ramflow", default-features = false }
 serde     = { version = "1", features = ["derive"] }
@@ -18,9 +20,8 @@ fp16-fallback      = []
 ham-offload        = []
 cuda               = ["flowcast/cuda", "ramflow/cuda"]
 cuda-double-buffer = ["flowcast/cuda-double-buffer"]
+python-ffi        = ["dep:pyo3"]
 
-[dev-dependencies]
-serde_json = "1"
 
 [[test]]
 name = "integration"
@@ -76,3 +77,17 @@ path = "tests/test_parity_guard.rs"
 [[test]]
 name = "test_ham_equivalence"
 path = "tests/test_ham_equivalence.rs"
+
+[[test]]
+name = "test_convergence"
+path = "tests/test_convergence.rs"
+
+[[test]]
+name = "test_resume"
+path = "tests/test_resume.rs"
+
+[[test]]
+name = "roofline"
+path = "tests/roofline.rs"
+
+

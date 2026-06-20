@@ -76,7 +76,9 @@ fn read_uncompressed(buf: &PinnedBuffer) -> Result<Vec<f32>> {
 fn store_compressed(data: &[f32]) -> Result<PinnedBuffer> {
     let n = data.len();
     if n == 0 {
-        return Err(DoublePassError::Checkpoint("cannot compress empty activation".into()));
+        return Err(DoublePassError::Checkpoint(
+            "cannot compress empty activation".into(),
+        ));
     }
 
     // Convert f32 → fp16 (u16) for the compress kernel's source.
@@ -182,7 +184,11 @@ fn fp16_to_f32(bits: u16) -> f32 {
         return sign * (man as f32) * (2.0f32.powi(-24));
     }
     if exp == 31 {
-        return if man == 0 { sign * f32::INFINITY } else { f32::NAN };
+        return if man == 0 {
+            sign * f32::INFINITY
+        } else {
+            f32::NAN
+        };
     }
     sign * (1.0 + man as f32 / 1024.0) * 2.0f32.powi(exp - 15)
 }

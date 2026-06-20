@@ -37,7 +37,10 @@ pub struct ParityTolerances {
 
 impl Default for ParityTolerances {
     fn default() -> Self {
-        Self { warn: 1e-4, halt: 1e-3 }
+        Self {
+            warn: 1e-4,
+            halt: 1e-3,
+        }
     }
 }
 
@@ -96,7 +99,7 @@ impl ParityGuard {
     pub fn should_check(&self, step: u64) -> bool {
         self.parity_check_interval > 0
             && step > 0
-            && step % self.parity_check_interval == 0
+            && step.is_multiple_of(self.parity_check_interval)
     }
 
     /// Run one parity check for `layer_idx`.
@@ -213,7 +216,10 @@ pub fn measure_parity(
 ) -> Result<f64> {
     let rel = compute_relative_error(stream_grad, reference_grad);
     if rel >= tolerances.halt {
-        return Err(DoublePassError::ParityHalt { layer_idx: ref_layer, rel });
+        return Err(DoublePassError::ParityHalt {
+            layer_idx: ref_layer,
+            rel,
+        });
     }
     Ok(rel)
 }

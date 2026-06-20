@@ -23,7 +23,11 @@ const CFG: BlockConfig = BlockConfig {
 fn make_inputs(g: usize) -> Vec<Vec<f32>> {
     let n = CFG.batch * CFG.seq_len * CFG.d_model;
     (0..g)
-        .map(|m| (0..n).map(|i| ((i + m * 17) as f64 * 0.05).sin() as f32).collect())
+        .map(|m| {
+            (0..n)
+                .map(|i| ((i + m * 17) as f64 * 0.05).sin() as f32)
+                .collect()
+        })
         .collect()
 }
 
@@ -36,8 +40,12 @@ fn test_weight_bytes_constant_in_g() {
     let plan = TrainingPlan::default();
 
     let expected_bytes = (N_LAYERS * CFG.bytes_per_layer()) as u64;
-    println!("\nT-AMORT: expected bytes = {} (= {} layers × {} bytes/layer)",
-             expected_bytes, N_LAYERS, CFG.bytes_per_layer());
+    println!(
+        "\nT-AMORT: expected bytes = {} (= {} layers × {} bytes/layer)",
+        expected_bytes,
+        N_LAYERS,
+        CFG.bytes_per_layer()
+    );
     println!("  {:>3}   {:>16}", "G", "weight_bytes");
 
     let mut prev_bytes: Option<u64> = None;
@@ -89,7 +97,9 @@ fn test_checkpoint_count_scales_with_g() {
             result.checkpoints.len(),
             expected_count,
             "expected {} checkpoints for G={}, got {}",
-            expected_count, g, result.checkpoints.len()
+            expected_count,
+            g,
+            result.checkpoints.len()
         );
     }
 }
@@ -106,7 +116,9 @@ fn test_full_step_two_x_sum_weights() {
     struct NullOpt;
     impl OptimizerBackend for NullOpt {
         fn project_and_accumulate(&self, _: &[f32], _: u32, _: &str) {}
-        fn lowrank_grad_sqnorm(&self, _: u32, _: &str) -> f64 { 0.0 }
+        fn lowrank_grad_sqnorm(&self, _: u32, _: &str) -> f64 {
+            0.0
+        }
         fn apply_update(&self, _: u32, _: &str, _: f32) {}
         fn zero_accum(&self, _: u32, _: &str) {}
         fn notify_step(&self, _: u64) {}
@@ -118,7 +130,10 @@ fn test_full_step_two_x_sum_weights() {
     let expected_total = 2 * N_LAYERS as u64 * bpl;
 
     println!("\nT-AMORT full step: expected 2·ΣW_i = {expected_total}");
-    println!("  {:>3}   {:>18}   {:>18}   {:>14}", "G", "fwd_bytes", "bwd_bytes", "total");
+    println!(
+        "  {:>3}   {:>18}   {:>18}   {:>14}",
+        "G", "fwd_bytes", "bwd_bytes", "total"
+    );
 
     let mut prev: Option<u64> = None;
     for &g in &[1usize, 2, 4, 8] {
@@ -132,14 +147,19 @@ fn test_full_step_two_x_sum_weights() {
             .map(|_| vec![1.0f32; CFG.batch * CFG.seq_len * CFG.d_model])
             .collect();
 
-        let bwd = full_backward(&model, &fwd, &inputs, &upstream, &plan, true, &NullOpt)
-            .expect("bwd");
+        let bwd =
+            full_backward(&model, &fwd, &inputs, &upstream, &plan, true, &NullOpt).expect("bwd");
 
         let total = fwd.weight_bytes_streamed + bwd.weight_loads;
-        println!("  {:>3}   {:>18}   {:>18}   {:>14}", g, fwd.weight_bytes_streamed, bwd.weight_loads, total);
+        println!(
+            "  {:>3}   {:>18}   {:>18}   {:>14}",
+            g, fwd.weight_bytes_streamed, bwd.weight_loads, total
+        );
 
-        assert_eq!(total, expected_total,
-            "T-AMORT full step G={g}: total={total} expected={expected_total}");
+        assert_eq!(
+            total, expected_total,
+            "T-AMORT full step G={g}: total={total} expected={expected_total}"
+        );
 
         if let Some(p) = prev {
             assert_eq!(total, p, "T-AMORT full step: total not constant across G");

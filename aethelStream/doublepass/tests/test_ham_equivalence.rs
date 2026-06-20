@@ -9,9 +9,9 @@
 
 #[cfg(feature = "ham-offload")]
 mod ham_tests {
-    use doublepass::forward::{BlockConfig, BlockWeights, single_layer_forward};
+    use doublepass::forward::{single_layer_forward, BlockConfig, BlockWeights};
     use doublepass::ham::{
-        backward_offload, backward_recompute, HamAction, SegmentActivationStore, Sars,
+        backward_offload, backward_recompute, HamAction, Sars, SegmentActivationStore,
     };
     use flowcast::HardwareProfile;
 
@@ -41,7 +41,9 @@ mod ham_tests {
 
     fn make_upstream(cfg: &BlockConfig) -> Vec<f32> {
         let n = cfg.bs() * cfg.d_model;
-        (0..n).map(|i| (i as f32 * 0.07 + 0.3).cos() * 0.01).collect()
+        (0..n)
+            .map(|i| (i as f32 * 0.07 + 0.3).cos() * 0.01)
+            .collect()
     }
 
     fn profile_io_bound() -> HardwareProfile {
@@ -124,15 +126,8 @@ mod ham_tests {
 
         // Run OFFLOAD backward.
         let mut ups_offload = vec![upstream.clone()];
-        let (grads_ol, stats_ol) = backward_offload(
-            &cfg,
-            &weights,
-            &layer_indices,
-            &store,
-            &mut ups_offload,
-            0,
-        )
-        .unwrap();
+        let (grads_ol, stats_ol) =
+            backward_offload(&cfg, &weights, &layer_indices, &store, &mut ups_offload, 0).unwrap();
 
         // --- Bit-identical assertion ---
         assert_eq!(
@@ -238,8 +233,7 @@ mod ham_tests {
         let input = make_input(&cfg);
         let layer_indices: Vec<usize> = vec![0, 1];
 
-        let mut fwd_all: Vec<Vec<doublepass::forward::SingleLayerFwdOut>> =
-            vec![Vec::new()];
+        let mut fwd_all: Vec<Vec<doublepass::forward::SingleLayerFwdOut>> = vec![Vec::new()];
         let mut act = input.clone();
         for &li in &layer_indices {
             let fwd_out = single_layer_forward(&cfg, &weights[li], &act);

@@ -21,7 +21,9 @@ const CFG: BlockConfig = BlockConfig {
 
 fn init_input() -> Vec<f32> {
     let n = CFG.bs() * CFG.d_model;
-    (0..n).map(|i| ((i as f64 * 0.05).sin() * 0.5) as f32).collect()
+    (0..n)
+        .map(|i| ((i as f64 * 0.05).sin() * 0.5) as f32)
+        .collect()
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
@@ -83,7 +85,9 @@ mod reference {
         a
     }
 
-    fn silu(x: f32) -> f32 { x / (1.0f32 + (-x).exp()) }
+    fn silu(x: f32) -> f32 {
+        x / (1.0f32 + (-x).exp())
+    }
     fn silu_grad(x: f32) -> f32 {
         let s = 1.0f32 / (1.0f32 + (-x).exp());
         s * (1.0f32 + x * (1.0f32 - s))
@@ -120,9 +124,16 @@ mod reference {
 
         let to_heads = |flat: &[f32]| -> Vec<f32> {
             let mut heads = vec![0.0f32; bh * s * dh];
-            for b in 0..CFG.batch { for hh in 0..h { for ss in 0..s { for t in 0..dh {
-                heads[((b * h + hh) * s + ss) * dh + t] = flat[(b * s + ss) * d + hh * dh + t];
-            }}}}
+            for b in 0..CFG.batch {
+                for hh in 0..h {
+                    for ss in 0..s {
+                        for t in 0..dh {
+                            heads[((b * h + hh) * s + ss) * dh + t] =
+                                flat[(b * s + ss) * d + hh * dh + t];
+                        }
+                    }
+                }
+            }
             heads
         };
         let q_heads = to_heads(&q_flat);
@@ -130,25 +141,43 @@ mod reference {
         let v_heads = to_heads(&v_flat);
 
         let mut scores = vec![0.0f32; bh * s * s];
-        for bh_i in 0..bh { for s1 in 0..s { for s2 in 0..s {
-            let mut dot = 0.0f32;
-            for t in 0..dh {
-                dot += q_heads[bh_i * s * dh + s1 * dh + t] * k_heads[bh_i * s * dh + s2 * dh + t];
+        for bh_i in 0..bh {
+            for s1 in 0..s {
+                for s2 in 0..s {
+                    let mut dot = 0.0f32;
+                    for t in 0..dh {
+                        dot += q_heads[bh_i * s * dh + s1 * dh + t]
+                            * k_heads[bh_i * s * dh + s2 * dh + t];
+                    }
+                    scores[bh_i * s * s + s1 * s + s2] = dot / scale;
+                }
             }
-            scores[bh_i * s * s + s1 * s + s2] = dot / scale;
-        }}}
+        }
         let attn = softmax_rows(&scores, bh * s, s);
 
         let mut attn_out_heads = vec![0.0f32; bh * s * dh];
-        for bh_i in 0..bh { for s1 in 0..s { for t in 0..dh { for s2 in 0..s {
-            attn_out_heads[bh_i * s * dh + s1 * dh + t] +=
-                attn[bh_i * s * s + s1 * s + s2] * v_heads[bh_i * s * dh + s2 * dh + t];
-        }}}}
+        for bh_i in 0..bh {
+            for s1 in 0..s {
+                for t in 0..dh {
+                    for s2 in 0..s {
+                        attn_out_heads[bh_i * s * dh + s1 * dh + t] +=
+                            attn[bh_i * s * s + s1 * s + s2] * v_heads[bh_i * s * dh + s2 * dh + t];
+                    }
+                }
+            }
+        }
 
         let mut attn_out = vec![0.0f32; bs * d];
-        for b in 0..CFG.batch { for hh in 0..h { for ss in 0..s { for t in 0..dh {
-            attn_out[(b * s + ss) * d + hh * dh + t] = attn_out_heads[((b * h + hh) * s + ss) * dh + t];
-        }}}}
+        for b in 0..CFG.batch {
+            for hh in 0..h {
+                for ss in 0..s {
+                    for t in 0..dh {
+                        attn_out[(b * s + ss) * d + hh * dh + t] =
+                            attn_out_heads[((b * h + hh) * s + ss) * dh + t];
+                    }
+                }
+            }
+        }
 
         let out_proj = proj(&attn_out, &w.wo, bs, d, d);
         let x2: Vec<f32> = input.iter().zip(&out_proj).map(|(a, b)| a + b).collect();
@@ -170,30 +199,46 @@ mod reference {
         // Down projection
         let mut d_hidden = vec![0.0f32; bs * ff];
         let mut d_wd_g = vec![0.0f32; d * ff];
-        for i in 0..bs { for j in 0..ff { for k in 0..d {
-            d_hidden[i * ff + j] += d_mlp_out[i * d + k] * w.wd[k * ff + j];
-        }}}
-        for k in 0..d { for j in 0..ff { for i in 0..bs {
-            d_wd_g[k * ff + j] += d_mlp_out[i * d + k] * hidden[i * ff + j];
-        }}}
+        for i in 0..bs {
+            for j in 0..ff {
+                for k in 0..d {
+                    d_hidden[i * ff + j] += d_mlp_out[i * d + k] * w.wd[k * ff + j];
+                }
+            }
+        }
+        for k in 0..d {
+            for j in 0..ff {
+                for i in 0..bs {
+                    d_wd_g[k * ff + j] += d_mlp_out[i * d + k] * hidden[i * ff + j];
+                }
+            }
+        }
 
         let d_silu_gate: Vec<f32> = (0..bs * ff).map(|i| d_hidden[i] * up[i]).collect();
         let d_up: Vec<f32> = (0..bs * ff).map(|i| d_hidden[i] * silu_gate[i]).collect();
-        let d_gate: Vec<f32> = (0..bs * ff).map(|i| d_silu_gate[i] * silu_grad(gate[i])).collect();
+        let d_gate: Vec<f32> = (0..bs * ff)
+            .map(|i| d_silu_gate[i] * silu_grad(gate[i]))
+            .collect();
 
         let mut d_h2 = vec![0.0f32; bs * d];
         let mut d_wg = vec![0.0f32; ff * d];
         let mut d_wu = vec![0.0f32; ff * d];
-        for i in 0..bs { for j in 0..ff { for k in 0..d {
-            d_h2[i * d + k] += d_gate[i * ff + j] * w.wg[j * d + k];
-            d_wg[j * d + k] += d_gate[i * ff + j] * h2[i * d + k];
-            d_h2[i * d + k] += d_up[i * ff + j] * w.wu[j * d + k];
-            d_wu[j * d + k] += d_up[i * ff + j] * h2[i * d + k];
-        }}}
+        for i in 0..bs {
+            for j in 0..ff {
+                for k in 0..d {
+                    d_h2[i * d + k] += d_gate[i * ff + j] * w.wg[j * d + k];
+                    d_wg[j * d + k] += d_gate[i * ff + j] * h2[i * d + k];
+                    d_h2[i * d + k] += d_up[i * ff + j] * w.wu[j * d + k];
+                    d_wu[j * d + k] += d_up[i * ff + j] * h2[i * d + k];
+                }
+            }
+        }
 
         let mut d_rms2_w = vec![0.0f32; d];
         for b in 0..bs {
-            for i in 0..d { d_rms2_w[i] += d_h2[b * d + i] * x_norm2[b * d + i]; }
+            for i in 0..d {
+                d_rms2_w[i] += d_h2[b * d + i] * x_norm2[b * d + i];
+            }
             let d_xn2: Vec<f32> = (0..d).map(|i| d_h2[b * d + i] * w.rms2_w[i]).collect();
             let dot: f32 = (0..d).map(|i| d_xn2[i] * x_norm2[b * d + i]).sum::<f32>() / d as f32;
             for i in 0..d {
@@ -204,54 +249,99 @@ mod reference {
         let d_out_proj = d_x2.clone();
         let mut d_attn_out = vec![0.0f32; bs * d];
         let mut d_wo = vec![0.0f32; d * d];
-        for i in 0..bs { for j in 0..d { for k in 0..d {
-            d_attn_out[i * d + k] += d_out_proj[i * d + j] * w.wo[j * d + k];
-            d_wo[j * d + k] += d_out_proj[i * d + j] * attn_out[i * d + k];
-        }}}
+        for i in 0..bs {
+            for j in 0..d {
+                for k in 0..d {
+                    d_attn_out[i * d + k] += d_out_proj[i * d + j] * w.wo[j * d + k];
+                    d_wo[j * d + k] += d_out_proj[i * d + j] * attn_out[i * d + k];
+                }
+            }
+        }
 
         let mut d_attn_out_h = vec![0.0f32; bh * s * dh];
-        for b in 0..CFG.batch { for hh in 0..h { for ss in 0..s { for t in 0..dh {
-            d_attn_out_h[((b * h + hh) * s + ss) * dh + t] = d_attn_out[(b * s + ss) * d + hh * dh + t];
-        }}}}
+        for b in 0..CFG.batch {
+            for hh in 0..h {
+                for ss in 0..s {
+                    for t in 0..dh {
+                        d_attn_out_h[((b * h + hh) * s + ss) * dh + t] =
+                            d_attn_out[(b * s + ss) * d + hh * dh + t];
+                    }
+                }
+            }
+        }
 
         let mut d_v_heads = vec![0.0f32; bh * s * dh];
-        for bh_i in 0..bh { for s2 in 0..s { for t in 0..dh { for s1 in 0..s {
-            d_v_heads[bh_i * s * dh + s2 * dh + t] +=
-                attn[bh_i * s * s + s1 * s + s2] * d_attn_out_h[bh_i * s * dh + s1 * dh + t];
-        }}}}
+        for bh_i in 0..bh {
+            for s2 in 0..s {
+                for t in 0..dh {
+                    for s1 in 0..s {
+                        d_v_heads[bh_i * s * dh + s2 * dh + t] += attn[bh_i * s * s + s1 * s + s2]
+                            * d_attn_out_h[bh_i * s * dh + s1 * dh + t];
+                    }
+                }
+            }
+        }
 
         let mut d_attn_logits = vec![0.0f32; bh * s * s];
-        for bh_i in 0..bh { for s1 in 0..s { for s2 in 0..s { for t in 0..dh {
-            d_attn_logits[bh_i * s * s + s1 * s + s2] +=
-                d_attn_out_h[bh_i * s * dh + s1 * dh + t] * v_heads[bh_i * s * dh + s2 * dh + t];
-        }}}}
+        for bh_i in 0..bh {
+            for s1 in 0..s {
+                for s2 in 0..s {
+                    for t in 0..dh {
+                        d_attn_logits[bh_i * s * s + s1 * s + s2] += d_attn_out_h
+                            [bh_i * s * dh + s1 * dh + t]
+                            * v_heads[bh_i * s * dh + s2 * dh + t];
+                    }
+                }
+            }
+        }
 
         let mut d_scores = vec![0.0f32; bh * s * s];
-        for bh_i in 0..bh { for s1 in 0..s {
-            let dot: f32 = (0..s)
-                .map(|s2| d_attn_logits[bh_i * s * s + s1 * s + s2] * attn[bh_i * s * s + s1 * s + s2])
-                .sum();
-            for s2 in 0..s {
-                d_scores[bh_i * s * s + s1 * s + s2] =
-                    attn[bh_i * s * s + s1 * s + s2] * (d_attn_logits[bh_i * s * s + s1 * s + s2] - dot);
+        for bh_i in 0..bh {
+            for s1 in 0..s {
+                let dot: f32 = (0..s)
+                    .map(|s2| {
+                        d_attn_logits[bh_i * s * s + s1 * s + s2] * attn[bh_i * s * s + s1 * s + s2]
+                    })
+                    .sum();
+                for s2 in 0..s {
+                    d_scores[bh_i * s * s + s1 * s + s2] = attn[bh_i * s * s + s1 * s + s2]
+                        * (d_attn_logits[bh_i * s * s + s1 * s + s2] - dot);
+                }
             }
-        }}
-        for v in &mut d_scores { *v /= scale; }
+        }
+        for v in &mut d_scores {
+            *v /= scale;
+        }
 
         let mut d_q_heads = vec![0.0f32; bh * s * dh];
         let mut d_k_heads = vec![0.0f32; bh * s * dh];
-        for bh_i in 0..bh { for s1 in 0..s { for t in 0..dh { for s2 in 0..s {
-            d_q_heads[bh_i * s * dh + s1 * dh + t] +=
-                d_scores[bh_i * s * s + s1 * s + s2] * k_heads[bh_i * s * dh + s2 * dh + t];
-            d_k_heads[bh_i * s * dh + s2 * dh + t] +=
-                d_scores[bh_i * s * s + s1 * s + s2] * q_heads[bh_i * s * dh + s1 * dh + t];
-        }}}}
+        for bh_i in 0..bh {
+            for s1 in 0..s {
+                for t in 0..dh {
+                    for s2 in 0..s {
+                        d_q_heads[bh_i * s * dh + s1 * dh + t] += d_scores
+                            [bh_i * s * s + s1 * s + s2]
+                            * k_heads[bh_i * s * dh + s2 * dh + t];
+                        d_k_heads[bh_i * s * dh + s2 * dh + t] += d_scores
+                            [bh_i * s * s + s1 * s + s2]
+                            * q_heads[bh_i * s * dh + s1 * dh + t];
+                    }
+                }
+            }
+        }
 
         let from_heads = |heads: &[f32]| -> Vec<f32> {
             let mut flat = vec![0.0f32; bs * d];
-            for b in 0..CFG.batch { for hh in 0..h { for ss in 0..s { for t in 0..dh {
-                flat[(b * s + ss) * d + hh * dh + t] = heads[((b * h + hh) * s + ss) * dh + t];
-            }}}}
+            for b in 0..CFG.batch {
+                for hh in 0..h {
+                    for ss in 0..s {
+                        for t in 0..dh {
+                            flat[(b * s + ss) * d + hh * dh + t] =
+                                heads[((b * h + hh) * s + ss) * dh + t];
+                        }
+                    }
+                }
+            }
             flat
         };
         let d_q_flat = from_heads(&d_q_heads);
@@ -262,21 +352,37 @@ mod reference {
         let mut d_wk = vec![0.0f32; d * d];
         let mut d_wv = vec![0.0f32; d * d];
         let mut d_h1 = vec![0.0f32; bs * d];
-        for i in 0..bs { for j in 0..d { for k in 0..d {
-            d_h1[i * d + k] += d_q_flat[i * d + j] * w.wq[j * d + k];
-            d_wq[j * d + k] += d_q_flat[i * d + j] * h1[i * d + k];
-            d_h1[i * d + k] += d_k_flat[i * d + j] * w.wk[j * d + k];
-            d_wk[j * d + k] += d_k_flat[i * d + j] * h1[i * d + k];
-            d_h1[i * d + k] += d_v_flat[i * d + j] * w.wv[j * d + k];
-            d_wv[j * d + k] += d_v_flat[i * d + j] * h1[i * d + k];
-        }}}
+        for i in 0..bs {
+            for j in 0..d {
+                for k in 0..d {
+                    d_h1[i * d + k] += d_q_flat[i * d + j] * w.wq[j * d + k];
+                    d_wq[j * d + k] += d_q_flat[i * d + j] * h1[i * d + k];
+                    d_h1[i * d + k] += d_k_flat[i * d + j] * w.wk[j * d + k];
+                    d_wk[j * d + k] += d_k_flat[i * d + j] * h1[i * d + k];
+                    d_h1[i * d + k] += d_v_flat[i * d + j] * w.wv[j * d + k];
+                    d_wv[j * d + k] += d_v_flat[i * d + j] * h1[i * d + k];
+                }
+            }
+        }
 
         let mut d_rms1_w = vec![0.0f32; d];
         for b in 0..bs {
-            for i in 0..d { d_rms1_w[i] += d_h1[b * d + i] * x_norm1[b * d + i]; }
+            for i in 0..d {
+                d_rms1_w[i] += d_h1[b * d + i] * x_norm1[b * d + i];
+            }
         }
 
-        RefGrads { d_rms1_w, d_wq, d_wk, d_wv, d_wo, d_rms2_w, d_wg, d_wu, d_wd: d_wd_g }
+        RefGrads {
+            d_rms1_w,
+            d_wq,
+            d_wk,
+            d_wv,
+            d_wo,
+            d_rms2_w,
+            d_wg,
+            d_wu,
+            d_wd: d_wd_g,
+        }
     }
 }
 
@@ -305,19 +411,25 @@ fn test_parity_fp32_single_layer() {
             let diff = max_abs_diff(&ref_grads.$rf, &prod_grads.$pf);
             let status = if diff < tol { "PASS" } else { "FAIL" };
             println!("  {:10}  max|Δ| = {:.3e}  {}", $name, diff, status);
-            assert!(diff < tol, "T-PARITY-1 FAILED {}: max|Δ| {:.3e} >= {:.3e}", $name, diff, tol);
+            assert!(
+                diff < tol,
+                "T-PARITY-1 FAILED {}: max|Δ| {:.3e} >= {:.3e}",
+                $name,
+                diff,
+                tol
+            );
         }};
     }
 
-    check!("rms1_w",  d_rms1_w, d_rms1_w);
-    check!("wq",      d_wq,     d_wq);
-    check!("wk",      d_wk,     d_wk);
-    check!("wv",      d_wv,     d_wv);
-    check!("wo",      d_wo,     d_wo);
-    check!("rms2_w",  d_rms2_w, d_rms2_w);
-    check!("wg",      d_wg,     d_wg);
-    check!("wu",      d_wu,     d_wu);
-    check!("wd",      d_wd,     d_wd);
+    check!("rms1_w", d_rms1_w, d_rms1_w);
+    check!("wq", d_wq, d_wq);
+    check!("wk", d_wk, d_wk);
+    check!("wv", d_wv, d_wv);
+    check!("wo", d_wo, d_wo);
+    check!("rms2_w", d_rms2_w, d_rms2_w);
+    check!("wg", d_wg, d_wg);
+    check!("wu", d_wu, d_wu);
+    check!("wd", d_wd, d_wd);
 
     println!("T-PARITY-1 PASSED  (tol = {:.0e})", tol);
 }
@@ -343,13 +455,25 @@ fn test_fd_sanity_wg0() {
     let loss = |delta: f32| -> f32 {
         let mut w2 = w.clone();
         w2.wg[0] += delta;
-        single_layer_forward(&CFG, &w2, &input).output.iter().sum::<f32>()
+        single_layer_forward(&CFG, &w2, &input)
+            .output
+            .iter()
+            .sum::<f32>()
     };
     let fd = (loss(eps) - loss(-eps)) / (2.0 * eps);
     let rel = (fd - analytical).abs() / fd.abs().max(1e-8);
 
-    println!("\nFD sanity wg[0]: analytical={:.6e}  fd={:.6e}  rel={:.3e}", analytical, fd, rel);
-    assert!(rel < 0.01, "FD sanity FAILED: rel={:.3e} (analytical={:.6e}, fd={:.6e})", rel, analytical, fd);
+    println!(
+        "\nFD sanity wg[0]: analytical={:.6e}  fd={:.6e}  rel={:.3e}",
+        analytical, fd, rel
+    );
+    assert!(
+        rel < 0.01,
+        "FD sanity FAILED: rel={:.3e} (analytical={:.6e}, fd={:.6e})",
+        rel,
+        analytical,
+        fd
+    );
     println!("FD sanity PASSED");
 }
 
@@ -382,4 +506,3 @@ fn test_shapes_and_no_nan() {
 #[test]
 #[ignore = "requires CUDA GPU — run manually with --features cuda"]
 fn test_parity_fp32_real_cuda() {}
-

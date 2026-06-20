@@ -28,8 +28,8 @@
 //! Because the backward call is identical in both cases, gradients are
 //! **bit-for-bit equal**.
 
-use crate::forward::{single_layer_forward, BlockConfig, BlockWeights, SingleLayerFwdOut};
 use crate::backward::{single_layer_backward, ParamGrads};
+use crate::forward::{single_layer_forward, BlockConfig, BlockWeights, SingleLayerFwdOut};
 use crate::plan::ActivationAction;
 use crate::state::RngState;
 use crate::{HardwareProfile, Result};
@@ -78,8 +78,7 @@ impl Sars {
         } else {
             f64::INFINITY
         };
-        let t_compute_s =
-            (self.profile.mean_forward_ms + self.profile.mean_backward_ms) as f64
+        let t_compute_s = (self.profile.mean_forward_ms + self.profile.mean_backward_ms) as f64
             * 1e-3
             * num_layers as f64;
         t_io_s > t_compute_s
@@ -96,14 +95,17 @@ impl Sars {
         num_layers: usize,
     ) -> HamAction {
         let io_bound = self.is_io_bound(segment_weight_bytes, num_layers);
-        let action = if io_bound { HamAction::Recompute } else { HamAction::Offload };
+        let action = if io_bound {
+            HamAction::Recompute
+        } else {
+            HamAction::Offload
+        };
         eprintln!(
             "[ham] seg={segment_index} layers={num_layers} \
              weight_bytes={segment_weight_bytes} \
              pcie_bw={:.3}GBs t_compute_ms={:.3} io_bound={io_bound} action={action:?}",
             self.profile.pcie_bandwidth_gbs,
-            (self.profile.mean_forward_ms + self.profile.mean_backward_ms)
-                * num_layers as f32,
+            (self.profile.mean_forward_ms + self.profile.mean_backward_ms) * num_layers as f32,
         );
         action
     }
@@ -162,7 +164,10 @@ impl SegmentActivationStore {
             .flat_map(|mb| mb.iter())
             .map(fwd_out_element_count)
             .sum();
-        Self { activations: fwd_per_micro_batch, element_count }
+        Self {
+            activations: fwd_per_micro_batch,
+            element_count,
+        }
     }
 
     /// Estimated bytes moved over PCIe to store and later reload these activations.
@@ -212,14 +217,15 @@ pub fn backward_recompute(
     layer_indices: &[usize],
     checkpoint_bufs: &[Vec<f32>],
     rng_states: &[Option<RngState>],
-    upstreams: &mut Vec<Vec<f32>>,
+    upstreams: &mut [Vec<f32>],
     segment_index: u32,
 ) -> Result<(Vec<ParamGrads>, HamSegmentStats)> {
     let num_micro_batches = checkpoint_bufs.len();
     let seg_len = layer_indices.len();
 
-    let mut seg_fwd: Vec<Vec<SingleLayerFwdOut>> =
-        (0..num_micro_batches).map(|_| Vec::with_capacity(seg_len)).collect();
+    let mut seg_fwd: Vec<Vec<SingleLayerFwdOut>> = (0..num_micro_batches)
+        .map(|_| Vec::with_capacity(seg_len))
+        .collect();
 
     for m in 0..num_micro_batches {
         let mut act = checkpoint_bufs[m].clone();
@@ -236,7 +242,12 @@ pub fn backward_recompute(
 
     let recompute_flops = estimate_recompute_flops(cfg, seg_len, num_micro_batches);
     let layer_grads = descend_backward(
-        cfg, weights, layer_indices, &seg_fwd, upstreams, num_micro_batches,
+        cfg,
+        weights,
+        layer_indices,
+        &seg_fwd,
+        upstreams,
+        num_micro_batches,
     );
     let stats = HamSegmentStats {
         segment_index,
@@ -271,14 +282,19 @@ pub fn backward_offload(
     weights: &[BlockWeights],
     layer_indices: &[usize],
     store: &SegmentActivationStore,
-    upstreams: &mut Vec<Vec<f32>>,
+    upstreams: &mut [Vec<f32>],
     segment_index: u32,
 ) -> Result<(Vec<ParamGrads>, HamSegmentStats)> {
     let num_micro_batches = store.activations.len();
     let pcie_bytes = store.pcie_bytes();
 
     let layer_grads = descend_backward(
-        cfg, weights, layer_indices, &store.activations, upstreams, num_micro_batches,
+        cfg,
+        weights,
+        layer_indices,
+        &store.activations,
+        upstreams,
+        num_micro_batches,
     );
     let stats = HamSegmentStats {
         segment_index,
@@ -305,7 +321,7 @@ fn descend_backward(
     weights: &[BlockWeights],
     layer_indices: &[usize],
     seg_fwd: &[Vec<SingleLayerFwdOut>],
-    upstreams: &mut Vec<Vec<f32>>,
+    upstreams: &mut [Vec<f32>],
     num_micro_batches: usize,
 ) -> Vec<ParamGrads> {
     let seg_len = layer_indices.len();
@@ -330,15 +346,33 @@ fn descend_backward(
 
 /// In-place addition of `src` parameter gradients into `dst`.
 fn accumulate_grads(dst: &mut ParamGrads, src: &ParamGrads) {
-    for (a, b) in dst.d_rms1_w.iter_mut().zip(&src.d_rms1_w) { *a += b; }
-    for (a, b) in dst.d_wq.iter_mut().zip(&src.d_wq) { *a += b; }
-    for (a, b) in dst.d_wk.iter_mut().zip(&src.d_wk) { *a += b; }
-    for (a, b) in dst.d_wv.iter_mut().zip(&src.d_wv) { *a += b; }
-    for (a, b) in dst.d_wo.iter_mut().zip(&src.d_wo) { *a += b; }
-    for (a, b) in dst.d_rms2_w.iter_mut().zip(&src.d_rms2_w) { *a += b; }
-    for (a, b) in dst.d_wg.iter_mut().zip(&src.d_wg) { *a += b; }
-    for (a, b) in dst.d_wu.iter_mut().zip(&src.d_wu) { *a += b; }
-    for (a, b) in dst.d_wd.iter_mut().zip(&src.d_wd) { *a += b; }
+    for (a, b) in dst.d_rms1_w.iter_mut().zip(&src.d_rms1_w) {
+        *a += b;
+    }
+    for (a, b) in dst.d_wq.iter_mut().zip(&src.d_wq) {
+        *a += b;
+    }
+    for (a, b) in dst.d_wk.iter_mut().zip(&src.d_wk) {
+        *a += b;
+    }
+    for (a, b) in dst.d_wv.iter_mut().zip(&src.d_wv) {
+        *a += b;
+    }
+    for (a, b) in dst.d_wo.iter_mut().zip(&src.d_wo) {
+        *a += b;
+    }
+    for (a, b) in dst.d_rms2_w.iter_mut().zip(&src.d_rms2_w) {
+        *a += b;
+    }
+    for (a, b) in dst.d_wg.iter_mut().zip(&src.d_wg) {
+        *a += b;
+    }
+    for (a, b) in dst.d_wu.iter_mut().zip(&src.d_wu) {
+        *a += b;
+    }
+    for (a, b) in dst.d_wd.iter_mut().zip(&src.d_wd) {
+        *a += b;
+    }
 }
 
 /// Count f32 scalars in a `SingleLayerFwdOut` (for PCIe-bytes telemetry).
@@ -369,11 +403,7 @@ fn fwd_out_element_count(fwd: &SingleLayerFwdOut) -> usize {
 /// Approximate recompute FLOPs: 8 dominant matmuls per layer x segment x micro-batches.
 ///
 /// `2 x bs x (4 x d^2 + 3 x d x ff) x seg_len x G`
-fn estimate_recompute_flops(
-    cfg: &BlockConfig,
-    seg_len: usize,
-    num_micro_batches: usize,
-) -> f64 {
+fn estimate_recompute_flops(cfg: &BlockConfig, seg_len: usize, num_micro_batches: usize) -> f64 {
     let bs = cfg.bs() as f64;
     let d = cfg.d_model as f64;
     let ff = cfg.d_ff as f64;

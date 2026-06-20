@@ -6,9 +6,9 @@
 //! Implementation: splitmix64 PRNG with per-(step, layer, micro) derived seeds.
 //! Under mock-cuda: host PRNG only. Under cuda: curandState (bytes), cfg-gated.
 
+use crate::error::DoublePassError;
 use crate::state::RngState;
 use crate::Result;
-use crate::error::DoublePassError;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 

@@ -74,7 +74,11 @@ fn bf16_mode_table_update_is_noop() {
     // Inject 100 % overflow — in bf16_mode the table should ignore it.
     table.update(0, 1000, 1000).unwrap();
     assert_eq!(table.get_scale(0).unwrap(), 1.0_f32);
-    assert_eq!(table.get_density(0).unwrap(), 0.0_f32, "density must stay 0 in bf16_mode");
+    assert_eq!(
+        table.get_density(0).unwrap(),
+        0.0_f32,
+        "density must stay 0 in bf16_mode"
+    );
 }
 
 #[test]
@@ -103,8 +107,7 @@ fn fp16_overflow_detected_returns_true() {
     // All elements are NaN → 100 % overflow.
     let overflow_data: Vec<u16> = vec![FP16_NAN; n];
 
-    let overflow =
-        check_and_update_scale(&mut table, 0, overflow_data.as_ptr(), n).unwrap();
+    let overflow = check_and_update_scale(&mut table, 0, overflow_data.as_ptr(), n).unwrap();
     assert!(overflow, "100 % NaN input must return overflow=true");
 }
 
@@ -157,8 +160,8 @@ fn fp16_clean_data_no_skip() {
     let mut table = make_table(2);
     let clean_data: Vec<u16> = vec![FP16_ONE; 500];
 
-    let overflow = check_and_update_scale(&mut table, 0, clean_data.as_ptr(), clean_data.len())
-        .unwrap();
+    let overflow =
+        check_and_update_scale(&mut table, 0, clean_data.as_ptr(), clean_data.len()).unwrap();
     assert!(!overflow, "clean data must not trigger skip");
 }
 
