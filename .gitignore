@@ -1,0 +1,17 @@
+# Rust build artifacts
+**/target/
+**/target2/
+**/*.rs.bk
+**/*.pdb
+**/*.exe
+**/*.d
+**/*.dll
+**/*.lib
+**/*.exp
+
+# IDEs and other ignores
+.vscode/
+.idea/
+.DS_Store
+.claude/
+CLAUDE.md
