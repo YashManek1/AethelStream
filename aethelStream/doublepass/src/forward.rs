@@ -311,7 +311,27 @@ impl Model {
     }
 }
 
-/// Return value of [`full_forward`].
+
+impl Model {
+    /// Load all transformer layers from a [`crate::WeightProvider`], building an in-memory model.
+    ///
+    /// Used to bridge M1 (shard_engine) weights into the M5 forward pass.
+    /// `SyntheticProvider` works with no file I/O; `ShardEngineProvider` streams from NVMe.
+    ///
+    /// # Errors
+    /// Propagates [`crate::weight_provider::ProviderError`] from each `load_layer_weights` call.
+    pub fn from_provider(
+        provider: &mut dyn crate::weight_provider::WeightProvider,
+        cfg: BlockConfig,
+    ) -> crate::weight_provider::ProviderResult<Self> {
+        let n = provider.num_layers() as usize;
+        let mut layers = Vec::with_capacity(n);
+        for i in 0..n {
+            layers.push(provider.load_layer_weights(i as u32, &cfg)?);
+        }
+        Ok(Self { layers, cfg })
+    }
+}/// Return value of [`full_forward`].
 pub struct FullForwardResult {
     /// Sparse activation checkpoints: `(layer_idx, micro_batch_idx, PinnedBuffer)`.
     ///

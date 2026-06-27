@@ -1,28 +1,4 @@
-*.pdf
-.clangd
-.vscode
-
-# IDEs and OS
-.idea/
-.DS_Store
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.pytest_cache/
-.venv/
-venv/
-env/
-
-# Rust
-rust_runtime/target/
-
-# Model Weights (keep index file)
-model_shards/*.safetensors
-
-# Temporary test/debug files
-test_out.txt
-codes.txt
-index.json
+.gitignore
+.*
+# Added by code-review-graph
+.code-review-graph/

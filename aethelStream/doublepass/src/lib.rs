@@ -27,6 +27,8 @@ pub mod sarp;
 pub mod schedule;
 pub mod state;
 pub mod train_step;
+pub mod shard_provider;
+pub mod weight_provider;
 
 pub use backward::{full_backward, single_layer_backward, FullBackwardResult, ParamGrads};
 pub use error::{DoublePassError, Result};
@@ -39,6 +41,8 @@ pub use parity::{
 };
 pub use plan::{ActivationAction, PlanDelta, SegmentPlan, TrainingPlan, TrainingTier};
 pub use state::ConsistentState;
+pub use shard_provider::{ParamNameMap, ShardEngineProvider};
+pub use weight_provider::{ProviderError, ProviderResult, SyntheticProvider, WeightProvider};
 
 // Re-export upstream types
 pub use flowcast::{Direction, FlowCast, FlowCastConfig, HardwareProfile, Precision, ReadyLayer};

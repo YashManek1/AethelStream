@@ -6,12 +6,17 @@ description = "AethelStream Module 5 — Double-Pass Backward Engine"
 build       = "build.rs"
 
 [dependencies]
-serde_json = "1"
-pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
-flowcast  = { path = "../flowcast", default-features = false }
-ramflow   = { path = "../ramflow", default-features = false }
-serde     = { version = "1", features = ["derive"] }
-thiserror = "1"
+serde_json    = "1"
+pyo3          = { version = "0.22", features = ["extension-module"], optional = true }
+flowcast      = { path = "../flowcast", default-features = false }
+ramflow       = { path = "../ramflow", default-features = false }
+shard_engine  = { path = "../shard_engine" }
+serde         = { version = "1", features = ["derive"] }
+thiserror     = "1"
+half          = "2.3.1"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [features]
 default            = []
@@ -91,3 +96,12 @@ name = "roofline"
 path = "tests/roofline.rs"
 
 
+
+
+[[bench]]
+name = "provider_bench"
+harness = false
+
+[[test]]
+name = "shard_test"
+path = "tests/shard_test.rs"
