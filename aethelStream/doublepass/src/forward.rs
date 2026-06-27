@@ -1,8 +1,6 @@
 //! A1 forward pass
 use crate::math::{add_vecs, matmul_tb, rms_norm_fwd, silu_f, softmax_rows};
-use crate::plan::TrainingPlan;
 use crate::state::RngState;
-use crate::{Batch, Result};
 use ramflow::PinnedBuffer;
 
 #[derive(Debug, Clone, Copy)]
@@ -408,7 +406,7 @@ pub fn full_forward(
             }
             // Run the layer forward; dropout is applied inside when dropout_p > 0.
             let fwd = single_layer_forward(&model.cfg, &model.layers[i], act);
-            *act = fwd.output.clone();
+            *act = fwd.output;
         }
     }
 
@@ -471,7 +469,7 @@ pub fn full_forward_with_retention(
             }
             let fwd = single_layer_forward(&model.cfg, &model.layers[i], act);
             retained_activations.push((i as u32, m as u32, fwd.clone()));
-            *act = fwd.output.clone();
+            *act = fwd.output;
         }
     }
 
@@ -633,11 +631,4 @@ pub fn selective_layer_forward(
     out
 }
 
-/// Run forward (stub).
-pub fn run_forward(
-    _flowcast: &crate::FlowCast,
-    _plan: &TrainingPlan,
-    _batch: &Batch,
-) -> Result<ForwardOutput> {
-    unimplemented!("forward stub")
-}
+

@@ -272,7 +272,7 @@ fn jacobi_eigenvectors(a: &[f32], n: usize) -> Result<(Vec<f32>, Vec<f32>)> {
 
 /// Whether subspace should refresh at this step.
 pub fn should_switch_subspace(step: u64, switch_interval: u64) -> bool {
-    switch_interval > 0 && step > 0 && step % switch_interval == 0
+    switch_interval > 0 && step > 0 && step.is_multiple_of(switch_interval)
 }
 
 /// Device-side randomized SVD entry point.
@@ -323,3 +323,4 @@ mod tests {
         assert!(should_switch_subspace(400, 200));
     }
 }
+

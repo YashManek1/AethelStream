@@ -1,7 +1,6 @@
 // src/phase/classifier.rs — training-phase types and phase classifier
 //
-// Sprint 0: all types declared, all methods unimplemented!.
-// These are the canonical phase definitions used by every other module:
+// Canonical phase definitions used by every other module:
 //   - Module 3 reads current_phase() to decide prefetch window size.
 //   - Module 5 calls notify_* to drive phase transitions.
 //   - The rebalancer subscribes to phase-transition callbacks.
@@ -111,8 +110,7 @@ pub enum Tier {
 
 /// Classifies tensors into tiers using a decaying frequency counter.
 ///
-/// # Sprint 0 contract
-/// Compiles; all methods `unimplemented!`.
+/// Classifies tensors into hot/warm/cold tiers using decaying frequency counters.
 pub struct TierClassifier {
     access_counts: Mutex<HashMap<u64, u32>>,
 }
@@ -242,3 +240,4 @@ impl PhaseClassifier for DefaultPhaseClassifier {
         });
     }
 }
+

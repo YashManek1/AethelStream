@@ -6,17 +6,17 @@ use crate::quantize::{dequantize_absmax, quantize_absmax};
 /// AdamW hyperparameters.
 #[derive(Debug, Clone, Copy)]
 pub struct AdamWConfig {
-    /// First moment decay β1.
+    /// First moment decay beta1.
     pub beta1: f32,
-    /// Second moment decay β2.
+    /// Second moment decay beta2.
     pub beta2: f32,
-    /// Numerical stability ε.
+    /// Numerical stability epsilon.
     pub eps: f32,
-    /// Learning rate α (NOT divided by rank unless [`scale_lr_by_rank`] is set).
+    /// Learning rate alpha (NOT divided by rank unless [`scale_lr_by_rank`] is set).
     pub lr: f32,
-    /// Weight decay λ (AdamW decoupled).
+    /// Weight decay lambda (AdamW decoupled).
     pub weight_decay: f32,
-    /// When true, effective step size is `lr / r` (α/r scaling variant for ablation).
+    /// When true, effective step size is `lr / r` (alpha/r scaling variant for ablation).
     pub scale_lr_by_rank: bool,
 }
 
@@ -42,11 +42,11 @@ pub fn effective_lr(cfg: &AdamWConfig, rank: usize) -> f32 {
     }
 }
 
-/// Low-rank AdamW state for one parameter matrix (r×r momentum/variance).
+/// Low-rank AdamW state for one parameter matrix (r*r momentum/variance).
 pub struct LowRankAdamState {
-    /// First moment M (r×r) in FP32 during update.
+    /// First moment M (r*r) in FP32 during update.
     pub momentum: Vec<f32>,
-    /// Second moment V (r×r) in FP32 during update.
+    /// Second moment V (r*r) in FP32 during update.
     pub variance: Vec<f32>,
     /// 8-bit compressed momentum.
     pub momentum_i8: Vec<i8>,
@@ -56,7 +56,7 @@ pub struct LowRankAdamState {
     pub scale_m: f32,
     /// Absmax scale for variance.
     pub scale_v: f32,
-    /// Accumulated low-rank gradient R (r×r).
+    /// Accumulated low-rank gradient R (r*r).
     pub grad_accum: Vec<f32>,
 }
 
@@ -109,19 +109,44 @@ impl LowRankAdamState {
     }
 }
 
+/// Core AdamW EMA update: compute M_t, V_t, return normalized N_t = M_t / (sqrt(V_t) + eps).
+///
+/// `accum` is the current low-rank gradient (r*r).
+/// Mutates momentum and variance in place; returns the normalized update vector.
+pub(crate) fn adamw_inner_update(
+    accum: &[f32],
+    momentum: &mut [f32],
+    variance: &mut [f32],
+    cfg: &AdamWConfig,
+) -> Vec<f32> {
+    let rr = accum.len();
+    debug_assert_eq!(momentum.len(), rr);
+    debug_assert_eq!(variance.len(), rr);
+    for i in 0..rr {
+        let g = accum[i];
+        momentum[i] = cfg.beta1 * momentum[i] + (1.0 - cfg.beta1) * g;
+        variance[i] = cfg.beta2 * variance[i] + (1.0 - cfg.beta2) * g * g;
+    }
+    let mut normalized = vec![0.0f32; rr];
+    for i in 0..rr {
+        normalized[i] = momentum[i] / (variance[i].sqrt() + cfg.eps);
+    }
+    normalized
+}
+
 /// Result of one AdamW step in low-rank space.
 pub struct AdamWStepResult {
-    /// Full-size weight update G̃ (m×n) to apply: w -= α * G̃.
+    /// Full-size weight update G_tilde (m*n) to apply: w -= alpha * G_tilde.
     pub weight_delta: Vec<f32>,
-    /// Normalized update N (r×r) before back-projection.
+    /// Normalized update N (r*r) before back-projection.
     pub normalized: Vec<f32>,
 }
 
 /// Execute Algorithm 2: AdamW in low-rank space with back-projection.
 ///
 /// 1. Project gradient: R_t = P^T @ G @ Q  (caller provides `grad` full or pre-projected)
-/// 2. AdamW on r×r: M, V, N = M / (sqrt(V) + ε)
-/// 3. Back-project: G̃ = P @ N @ Q^T
+/// 2. AdamW on r*r: M, V, N = M / (sqrt(V) + eps)
+/// 3. Back-project: G_tilde = P @ N @ Q^T
 /// 4. Quantize M, V to 8-bit
 pub fn adamw_lowrank_step(
     grad_full: &[f32],
@@ -137,7 +162,6 @@ pub fn adamw_lowrank_step(
     let mut projected = vec![0.0f32; r * r];
     project_forward_f32(grad_full, p, q, &mut projected, m, n, r);
 
-    // Add any accumulated gradient from backward hook.
     for (a, g) in projected.iter_mut().zip(state.grad_accum.iter()) {
         *a += g;
     }
@@ -147,17 +171,7 @@ pub fn adamw_lowrank_step(
         }
     }
 
-    let rr = r * r;
-    for i in 0..rr {
-        state.momentum[i] = cfg.beta1 * state.momentum[i] + (1.0 - cfg.beta1) * projected[i];
-        state.variance[i] =
-            cfg.beta2 * state.variance[i] + (1.0 - cfg.beta2) * projected[i] * projected[i];
-    }
-
-    let mut normalized = vec![0.0f32; rr];
-    for i in 0..rr {
-        normalized[i] = state.momentum[i] / (state.variance[i].sqrt() + cfg.eps);
-    }
+    let normalized = adamw_inner_update(&projected, &mut state.momentum, &mut state.variance, cfg);
 
     let mut weight_delta = vec![0.0f32; m * n];
     project_backward_f32(&normalized, p, q, &mut weight_delta, m, n, r);
@@ -203,5 +217,15 @@ mod tests {
         state.dequantize_from_ram();
         let result = adamw_lowrank_step(&g, &p, &q, &mut state, m, n, r, &AdamWConfig::default(), 1.0);
         assert_eq!(result.weight_delta.len(), m * n);
+    }
+
+    #[test]
+    fn adamw_inner_update_decreasing_normalized() {
+        let accum = vec![0.1f32; 4];
+        let mut m = vec![0.0f32; 4];
+        let mut v = vec![0.0f32; 4];
+        let cfg = AdamWConfig::default();
+        let n = adamw_inner_update(&accum, &mut m, &mut v, &cfg);
+        assert!(n[0].abs() > 0.0, "normalized should be nonzero");
     }
 }

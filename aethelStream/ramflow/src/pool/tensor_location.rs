@@ -37,8 +37,7 @@ pub struct TensorInfo {
 /// Central registry of every tensor in every layer, loaded from
 /// `shard_index.json` produced by Module 1.
 ///
-/// # Sprint 0 contract
-/// Struct compiles and can be constructed; iterator methods `unimplemented!`.
+/// Central registry of every tensor in every layer, loaded from shard_index.json.
 pub struct TensorLocationDict {
     /// (layer_index, tensor_name) → TensorInfo
     inner: HashMap<(u32, String), TensorInfo>,
@@ -272,3 +271,4 @@ pub enum TensorLocation {
     /// Partially on host, partially on NVMe (transitional).
     Transitioning,
 }
+

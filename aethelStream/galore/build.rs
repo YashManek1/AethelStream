@@ -52,7 +52,7 @@ fn main() {
                 cu_src,
                 "-o",
                 obj_file.to_str().expect("utf8"),
-                "-arch=sm_75",
+                cuda_arch().as_str(),
                 "--std=c++17",
                 "-O3",
                 "-Ikernels",
@@ -70,16 +70,7 @@ fn main() {
     }
 
     let lib_path = out_dir.join("libgalore_kernels.a");
-    let ar_status = Command::new("ar")
-        .arg("rcs")
-        .arg(&lib_path)
-        .args(&obj_files)
-        .status()
-        .expect("ar spawn failed");
-
-    if !ar_status.success() {
-        panic!("ar archive creation failed");
-    }
+    archive_objects(&lib_path, &obj_files);
 
     if let Some(cuda_lib) = find_cuda_lib_dir() {
         println!("cargo:rustc-link-search=native={}", cuda_lib.display());
@@ -91,6 +82,55 @@ fn main() {
     println!("cargo:rustc-cfg=galore_real_cuda");
 }
 
+/// Cross-platform static archive creation.
+/// Windows: tries MSVC `lib.exe` first, falls back to `llvm-ar`.
+/// Unix: uses `ar`.
+fn archive_objects(lib_path: &PathBuf, obj_files: &[PathBuf]) {
+    #[cfg(target_os = "windows")]
+    {
+        let out_arg = format!("/OUT:{}", lib_path.display());
+        let msvc_ok = Command::new("lib.exe")
+            .arg(&out_arg)
+            .args(obj_files)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if !msvc_ok {
+            let status = Command::new("llvm-ar")
+                .arg("rcs")
+                .arg(lib_path)
+                .args(obj_files)
+                .status()
+                .expect("llvm-ar spawn failed (install LLVM or use MSVC lib.exe)");
+            if !status.success() {
+                panic!("archive creation failed (tried lib.exe and llvm-ar)");
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let status = Command::new("ar")
+            .arg("rcs")
+            .arg(lib_path)
+            .args(obj_files)
+            .status()
+            .expect("ar spawn failed");
+        if !status.success() {
+            panic!("ar archive creation failed");
+        }
+    }
+}
+
+/// Return the `-arch=` flag value from `CUDA_ARCH` env var, or a safe default.
+/// Default `sm_75` (Turing) runs on every GPU from RTX 2060 through H100.
+/// Set `CUDA_ARCH=sm_86` for RTX 30xx, `sm_89` for RTX 40xx, `sm_90` for H100.
+fn cuda_arch() -> String {
+    let arch = std::env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_75".to_string());
+    format!("-arch={arch}")
+}
 fn find_nvcc() -> Option<PathBuf> {
     if let Ok(nvcc_env) = env::var("NVCC") {
         let path = PathBuf::from(nvcc_env);
@@ -142,3 +182,4 @@ fn find_cuda_lib_dir() -> Option<PathBuf> {
     }
     None
 }
+

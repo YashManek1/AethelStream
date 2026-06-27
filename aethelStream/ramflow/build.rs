@@ -91,8 +91,8 @@ fn main() {
     // Sprint 2 adds overflow_check.cu. All .cu files compile with the same
     // flags. The resulting .o files are archived together into one static lib.
     //
-    // -arch=sm_75: Turing minimum (RTX 2000, T4). Ampere (sm_80) and Ada
-    //   (sm_89) are backward-compatible with sm_75 PTX. Setting sm_75 means
+    // -arch=chosen via CUDA_ARCH env var (default sm_75)
+    //
     //   the PTX JIT will re-optimize for the actual GPU at runtime.
     //
     // --relocatable-device-code=true: Enables separate compilation — the
@@ -123,8 +123,8 @@ fn main() {
                 "--relocatable-device-code=true",
                 "--std=c++17",
                 "-O3",
-                // Minimum target: Turing (sm_75). All newer GPUs are compatible.
-                "-arch=sm_75",
+                // Higher arches enable BF16 Tensor Cores and async-copy (sm_80+).
+                cuda_arch().as_str(),
                 // Include the kernels/ directory so .cu files can #include .cuh headers.
                 "-Ikernels",
                 "-c",
@@ -224,6 +224,11 @@ fn find_nvcc() -> Option<PathBuf> {
     None
 }
 
+fn cuda_arch() -> String {
+    let arch = std::env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_75".to_string());
+    format!("-arch={arch}")
+}
+
 fn nvcc_exe() -> &'static str {
     if cfg!(target_os = "windows") {
         "nvcc.exe"
@@ -251,3 +256,4 @@ fn find_cuda_lib_dir() -> Option<PathBuf> {
     }
     None
 }
+

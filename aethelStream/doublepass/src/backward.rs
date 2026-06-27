@@ -2,11 +2,10 @@
 
 use crate::math::silu_grad_f;
 
-use crate::{LoraBackend, OptimizerBackend, Result};
+use crate::OptimizerBackend;
 
 use crate::forward::{BlockConfig, BlockWeights, SingleLayerFwdOut};
 
-use crate::metrics::StepMetrics;
 
 use crate::plan::TrainingPlan;
 
@@ -351,23 +350,6 @@ pub fn single_layer_backward(
 
         d_input,
     }
-}
-
-/// Run.
-pub fn run_backward(
-    _flowcast: &mut crate::FlowCast,
-
-    _plan: &TrainingPlan,
-
-    _forward_out: &crate::forward::ForwardOutput,
-
-    _optimizer: &dyn OptimizerBackend,
-
-    _lora: Option<&dyn LoraBackend>,
-
-    _metrics: &mut StepMetrics,
-) -> Result<()> {
-    unimplemented!("backward::run_backward  A2 S0 stub")
 }
 
 /// Result of [`full_backward`]: accumulated parameter gradients and weight-load count.
@@ -792,3 +774,5 @@ fn count_activation_elements(fwd: &crate::forward::SingleLayerFwdOut) -> usize {
         + fwd.mlp_out.len()
         + fwd.output.len()
 }
+
+

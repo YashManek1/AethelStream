@@ -92,20 +92,18 @@ impl OptimizerBackend for StandardAdamW {
                 return;
             };
 
-            if clip_scale != 1.0 {
-                for v in ps.grad_accum.iter_mut() {
-                    *v *= clip_scale;
-                }
-            }
-
             let cfg = &self.adam;
-            let n = ps.grad_accum.len();
-            let mut delta = vec![0.0f32; n];
-            for i in 0..n {
-                let g = ps.grad_accum[i];
-                ps.momentum[i] = cfg.beta1 * ps.momentum[i] + (1.0 - cfg.beta1) * g;
-                ps.variance[i] = cfg.beta2 * ps.variance[i] + (1.0 - cfg.beta2) * g * g;
-                delta[i] = cfg.lr * ps.momentum[i] / (ps.variance[i].sqrt() + cfg.eps);
+            // clip_scale applied to a temporary — never mutate grad_accum in-place
+            let mut delta = vec![0.0f32; ps.grad_accum.len()];
+            for (((d, m), v), g) in delta.iter_mut()
+                .zip(ps.momentum.iter_mut())
+                .zip(ps.variance.iter_mut())
+                .zip(ps.grad_accum.iter())
+            {
+                let g_scaled = g * clip_scale;
+                *m = cfg.beta1 * *m + (1.0 - cfg.beta1) * g_scaled;
+                *v = cfg.beta2 * *v + (1.0 - cfg.beta2) * g_scaled * g_scaled;
+                *d = cfg.lr * *m / (v.sqrt() + cfg.eps);
             }
             delta
         };
@@ -135,3 +133,4 @@ impl OptimizerBackend for StandardAdamW {
         ProjectorKind::Orthonormal
     }
 }
+

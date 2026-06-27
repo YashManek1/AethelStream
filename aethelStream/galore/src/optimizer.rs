@@ -204,13 +204,6 @@ impl GaLoreOptimizer {
         self.step.lock().map(|s| *s).unwrap_or(0)
     }
 
-    /// Schedule randomized SVD refresh (non-blocking — runs during write-back slot).
-    pub fn schedule_subspace_refresh(&self, layer_idx: u32, param_name: &str, grad: Vec<f32>) {
-        if let Ok(mut pending) = self.pending_svd.lock() {
-            pending.push((layer_idx, param_name.to_string(), grad));
-        }
-    }
-
     /// Process pending SVD jobs on device (never on CPU hot path).
     pub fn process_pending_svd(&self) -> Result<()> {
         let jobs: Vec<_> = {
@@ -318,28 +311,23 @@ impl OptimizerBackend for GaLoreOptimizer {
             let Some(ps) = params.get_mut(&key) else {
                 return;
             };
-
             ps.adam.dequantize_from_ram();
 
-            if clip_scale != 1.0 {
-                for v in ps.adam.grad_accum.iter_mut() {
-                    *v *= clip_scale;
-                }
-            }
+            // Apply clipping to a temporary -- never mutate grad_accum in-place
+            // so that zero_accum() is the sole owner of clearing the accumulator.
+            let accum: Vec<f32> = if clip_scale != 1.0 {
+                ps.adam.grad_accum.iter().map(|v| v * clip_scale).collect()
+            } else {
+                ps.adam.grad_accum.clone()
+            };
 
-            let rr = ps.rank * ps.rank;
             let cfg = &self.config.adam;
-            for i in 0..rr {
-                let r_t = ps.adam.grad_accum[i];
-                ps.adam.momentum[i] = cfg.beta1 * ps.adam.momentum[i] + (1.0 - cfg.beta1) * r_t;
-                ps.adam.variance[i] =
-                    cfg.beta2 * ps.adam.variance[i] + (1.0 - cfg.beta2) * r_t * r_t;
-            }
-
-            let mut normalized = vec![0.0f32; rr];
-            for i in 0..rr {
-                normalized[i] = ps.adam.momentum[i] / (ps.adam.variance[i].sqrt() + cfg.eps);
-            }
+            let normalized = crate::adamw::adamw_inner_update(
+                &accum,
+                &mut ps.adam.momentum,
+                &mut ps.adam.variance,
+                cfg,
+            );
 
             let mut weight_delta = vec![0.0f32; ps.m * ps.n];
             project_backward_f32(&normalized, &ps.p, &ps.q, &mut weight_delta, ps.m, ps.n, ps.rank);
@@ -476,3 +464,5 @@ mod tests {
         let _ = std::fs::remove_file(std::env::temp_dir().join("galore_opt_test.bin"));
     }
 }
+
+

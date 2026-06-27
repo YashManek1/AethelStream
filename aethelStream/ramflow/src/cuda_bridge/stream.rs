@@ -80,7 +80,7 @@ impl CudaStream {
     ///
     /// # Safety
     /// The returned pointer is only valid while `self` is alive.
-    pub(crate) fn as_raw(&self) -> *mut std::os::raw::c_void {
+    pub fn as_raw(&self) -> *mut std::os::raw::c_void {
         self.ptr
     }
 }

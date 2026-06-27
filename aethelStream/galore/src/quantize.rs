@@ -33,7 +33,7 @@ pub fn dequantize_absmax(quantized: &[i8], scale: f32, out: &mut [f32]) {
     }
 }
 
-/// Relative round-trip error: max|x - x̂| / max|x|.
+/// Relative round-trip error: max|x - x_hat| / max|x|.
 pub fn quantize_relative_error(tensor: &[f32]) -> f32 {
     let mut q = vec![0i8; tensor.len()];
     let scale = quantize_absmax(tensor, &mut q);
@@ -52,22 +52,22 @@ pub fn quantize_relative_error(tensor: &[f32]) -> f32 {
     max_err / max_abs
 }
 
-/// Round-trip quantisation error (max absolute).
-pub fn quantize_max_error(tensor: &[f32]) -> f32 {
-    let mut q = vec![0i8; tensor.len()];
-    let scale = quantize_absmax(tensor, &mut q);
-    let mut recon = vec![0.0f32; tensor.len()];
-    dequantize_absmax(&q, scale, &mut recon);
-    tensor
-        .iter()
-        .zip(recon.iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Max absolute round-trip error (internal test helper).
+    fn quantize_max_error(tensor: &[f32]) -> f32 {
+        let mut q = vec![0i8; tensor.len()];
+        let scale = quantize_absmax(tensor, &mut q);
+        let mut recon = vec![0.0f32; tensor.len()];
+        dequantize_absmax(&q, scale, &mut recon);
+        tensor
+            .iter()
+            .zip(recon.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max)
+    }
 
     #[test]
     fn quantize_dequantize_bounded_error() {

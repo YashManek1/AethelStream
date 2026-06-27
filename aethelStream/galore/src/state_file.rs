@@ -148,7 +148,7 @@ pub struct LayerDescriptor {
 }
 
 impl LayerDescriptor {
-    fn to_bytes(&self) -> [u8; LAYER_DESC_SIZE] {
+    fn to_bytes(self) -> [u8; LAYER_DESC_SIZE] {
         let mut buf = [0u8; LAYER_DESC_SIZE];
         buf[0..4].copy_from_slice(&self.m.to_le_bytes());
         buf[4..8].copy_from_slice(&self.n.to_le_bytes());
@@ -654,3 +654,4 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 }
+

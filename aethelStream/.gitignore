@@ -1,3 +1,5 @@
 .claude
 graphify-out
 CLAUDE.md
+target/
+COMMANDS.md

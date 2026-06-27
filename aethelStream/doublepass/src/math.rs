@@ -3,22 +3,6 @@
 //! Provides row-major matrix operations, RMSNorm, softmax, and SiLU
 //! in pure Rust (mock-cuda). CUDA kernels would replace these in production.
 
-#[allow(dead_code)]
-/// Matrix multiply: c = a @ b, row-major.
-/// a: [m, k], b: [k, n] → c: [m, n]
-pub(crate) fn matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
-    let mut c = vec![0.0f32; m * n];
-    for i in 0..m {
-        for l in 0..k {
-            let a_il = a[i * k + l];
-            for j in 0..n {
-                c[i * n + j] += a_il * b[l * n + j];
-            }
-        }
-    }
-    c
-}
-
 /// Matrix multiply with transposed B: c = a @ b.T, row-major.
 /// a: [m, k], b: [n, k] (stored as such, so b.T is [k, n]) → c: [m, n]
 /// Equivalent to: c[i*n+j] = sum_l a[i*k+l] * b[j*k+l]

@@ -61,7 +61,7 @@ fn main() {
             .arg(cu_src)
             .arg("-o")
             .arg(&obj_file)
-            .arg("-arch=sm_75")
+            .arg(cuda_arch().as_str())
             .arg("--std=c++17")
             .arg("-O3")
             .arg("-Ikernels")
@@ -78,22 +78,34 @@ fn main() {
 
     // Archive object files into libdoublepass_kernels.a
     let lib_path = out_dir.join("libdoublepass_kernels.a");
-    let ar_status = std::process::Command::new("ar")
-        .arg("rcs")
-        .arg(&lib_path)
-        .args(&obj_files)
-        .status()
-        .expect("ar spawn failed");
-
-    if !ar_status.success() {
-        panic!("ar archive creation failed");
-    }
+    archive_objects(&lib_path, &obj_files);
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=doublepass_kernels");
     println!("cargo:rustc-link-lib=dylib=cudart");
 }
 
+fn archive_objects(lib_path: &PathBuf, obj_files: &[PathBuf]) {
+    use std::process::{Command, Stdio};
+    #[cfg(target_os = "windows")]
+    {
+        let out_arg = format!("/OUT:{}", lib_path.display());
+        let ok = Command::new("lib.exe").arg(&out_arg).args(obj_files)
+            .stdout(Stdio::null()).stderr(Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false);
+        if !ok {
+            let s = Command::new("llvm-ar").arg("rcs").arg(lib_path).args(obj_files)
+                .status().expect("llvm-ar spawn failed");
+            if !s.success() { panic!("archive creation failed (lib.exe and llvm-ar both failed)"); }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let s = Command::new("ar").arg("rcs").arg(lib_path).args(obj_files)
+            .status().expect("ar spawn failed");
+        if !s.success() { panic!("ar archive creation failed"); }
+    }
+}
 /// Find nvcc executable in NVCC env, CUDA_PATH/bin, or PATH.
 fn find_nvcc() -> Option<PathBuf> {
     if let Ok(nvcc_env) = env::var("NVCC") {
@@ -104,23 +116,34 @@ fn find_nvcc() -> Option<PathBuf> {
     }
 
     if let Ok(cuda_path) = env::var("CUDA_PATH") {
-        let nvcc = PathBuf::from(&cuda_path).join("bin").join("nvcc");
+        let nvcc = PathBuf::from(&cuda_path).join("bin").join(nvcc_exe());
         if nvcc.exists() {
             return Some(nvcc);
         }
     }
 
     // Try PATH
-    if let Ok(path_env) = env::var("PATH") {
-        for path_dir in env::split_paths(&path_env) {
-            let nvcc = path_dir.join("nvcc");
-            if nvcc.exists() {
-                return Some(nvcc);
-            }
-        }
+    if std::process::Command::new(nvcc_exe())
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        return Some(PathBuf::from(nvcc_exe()));
     }
 
     None
+}
+
+fn cuda_arch() -> String {
+    let arch = std::env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_75".to_string());
+    format!("-arch={arch}")
+}
+
+fn nvcc_exe() -> &'static str {
+    if cfg!(target_os = "windows") { "nvcc.exe" } else { "nvcc" }
 }
 
 /// Find CUDA lib directory (cudart).
@@ -137,3 +160,5 @@ fn find_cuda_lib_dir() -> PathBuf {
     }
     PathBuf::from("/usr/local/cuda/lib64")
 }
+
+

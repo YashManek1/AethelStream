@@ -171,11 +171,13 @@ pub trait LoraBackend: Send + Sync {
 /// activation_schedule: Vec<SegmentPlan>, parity_check_interval: u64,
 /// projection_refresh_interval: u64, max_grad_norm: f32
 /// ```
-#[allow(dead_code)]
 pub struct DoublePass {
+    #[allow(dead_code)]
     flowcast: FlowCast,
     plan: Option<TrainingPlan>,
+    #[allow(dead_code)]
     optimizer: Option<Box<dyn OptimizerBackend>>,
+    #[allow(dead_code)]
     lora: Option<Box<dyn LoraBackend>>,
     step_count: u64,
 }

@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "shard_engine",
+    "ramflow",
+    "flowcast",
+    "galore",
+    "doublepass",
+]
+
+[workspace.package]
+version  = "0.1.0"
+edition  = "2021"
+license  = "MIT OR Apache-2.0"
+authors  = ["AethelStream Contributors"]
+
+# Shared dependency versions — member crates inherit these via workspace.dependencies.
+[workspace.dependencies]
+thiserror  = "1"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+memmap2    = "0.9"
+half       = "2.3.1"
+pyo3       = { version = "0.22", features = ["extension-module"] }
+criterion  = { version = "0.5", features = ["html_reports"] }
+tempfile   = "3"
+
+# ────────────────────────────────────────────────────────────────
+# Workspace-wide feature flags for uniform mock-cuda / cuda builds:
+#
+#   mock-cuda  — route all GPU paths through CPU reference impls
+#   cuda       — compile CUDA kernels (requires nvcc + CUDA toolkit)
+#
+# Usage (runs every crate together):
+#   cargo test  --workspace --no-default-features --features mock-cuda
+#   cargo build --workspace --no-default-features --features cuda
+# ────────────────────────────────────────────────────────────────
+[workspace.metadata.build]
+# Minimum CUDA compute capability (Turing / RTX 2080+).
+# Change to sm_80 for Ampere (A100) or sm_90 for Hopper (H100).
+cuda_arch = "sm_75"

@@ -48,7 +48,7 @@ impl ParamNameMap {
 
 /// Convert raw little-endian FP16 bytes to `Vec<f32>`.
 fn fp16_bytes_to_f32(data: &[u8]) -> ProviderResult<Vec<f32>> {
-    if data.len() % 2 != 0 {
+    if !data.len().is_multiple_of(2) {
         return Err(ProviderError::ConversionError(format!(
             "FP16 data length {} is not even",
             data.len()
@@ -145,3 +145,4 @@ impl WeightProvider for ShardEngineProvider {
         self.n_heads
     }
 }
+
