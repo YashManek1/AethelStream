@@ -1,0 +1,38 @@
+[package]
+name        = "galore"
+version     = "0.1.0"
+edition     = "2021"
+description = "AethelStream Module 4 — GaLore heterogeneous optimizer state"
+build       = "build.rs"
+
+[dependencies]
+doublepass = { path = "../doublepass", default-features = false }
+ramflow    = { path = "../ramflow", default-features = false }
+thiserror  = "1"
+memmap2    = "0.9"
+serde_json = "1"
+
+[features]
+default   = []
+mock-cuda = ["ramflow/mock-cuda", "doublepass/mock-cuda"]
+cuda      = ["ramflow/cuda", "doublepass/cuda"]
+
+[[test]]
+name = "test_galore_projection_roundtrip"
+path = "tests/test_galore_projection_roundtrip.rs"
+
+[[test]]
+name = "test_galore_quantize_roundtrip"
+path = "tests/test_galore_quantize_roundtrip.rs"
+
+[[test]]
+name = "test_galore_theorem_38"
+path = "tests/test_galore_theorem_38.rs"
+
+[[test]]
+name = "test_galore_scale_independence"
+path = "tests/test_galore_scale_independence.rs"
+
+[[test]]
+name = "test_optimizer_state_resume"
+path = "tests/test_optimizer_state_resume.rs"
